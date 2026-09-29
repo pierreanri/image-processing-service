@@ -7,8 +7,8 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, Response, Up
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
-from app.deps import CurrentUser, DbSession, SettingsDep, StorageDep
-from app.imaging import FORMATS, apply_transformations, load_image
+from app.deps import CurrentUser, DbSession, SettingsDep, StorageDep, VariantCacheDep
+from app.imaging import DEFAULT_QUALITY, FORMATS, apply_transformations, load_image
 from app.models import Image, User
 from app.schemas import ImageFormat, ImageList, ImageOut, TransformationSpec, TransformRequest
 from app.storage import LocalStorage, build_key
@@ -100,34 +100,44 @@ def get_image_content(
     db: DbSession,
     storage: StorageDep,
     settings: SettingsDep,
+    cache: VariantCacheDep,
     format: Annotated[
         ImageFormat | None, Query(description="Convert to this format on the fly.")
     ] = None,
     quality: Annotated[int | None, Query(ge=1, le=100, description="JPEG/WebP quality.")] = None,
 ) -> Response:
-    """Download an image, optionally converted to another format or quality."""
+    """Download an image, optionally converted to another format or quality.
+
+    Conversions are cached in Redis when it is configured.
+    """
     image = _get_owned_image(db, user, image_id)
     target_format = format or image.format
     serve_original = quality is None and target_format == image.format
 
-    variant = "" if serve_original else f"-{target_format}-q{quality or 'default'}"
-    etag = f'"{image.id.hex}{variant}"'
+    # Lossless formats ignore quality, so all qualities share one ETag and cache entry. The
+    # variant token is both the ETag suffix and the cache field, so the two can't drift apart.
+    effective_quality = quality if target_format in DEFAULT_QUALITY else None
+    variant = None if serve_original else f"{target_format}-q{effective_quality or 'default'}"
+    etag = f'"{image.id.hex}"' if variant is None else f'"{image.id.hex}-{variant}"'
     headers = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
     if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
 
-    if serve_original:
+    if variant is None:
         return FileResponse(
             storage.path(image.storage_key), media_type=image.mime_type, headers=headers
         )
 
-    loaded = load_image(storage.read(image.storage_key), settings.max_image_pixels)
-    result = apply_transformations(
-        loaded,
-        TransformationSpec(format=target_format, quality=quality),
-        settings.max_dimension,
-    )
-    return Response(result.data, media_type=result.mime_type, headers=headers)
+    data = cache.get(image.id, variant)
+    if data is None:
+        loaded = load_image(storage.read(image.storage_key), settings.max_image_pixels)
+        data = apply_transformations(
+            loaded,
+            TransformationSpec(format=target_format, quality=effective_quality),
+            settings.max_dimension,
+        ).data
+        cache.set(image.id, variant, data)
+    return Response(data, media_type=FORMATS[target_format].mime_type, headers=headers)
 
 
 @router.post("/{image_id}/transform", status_code=status.HTTP_201_CREATED)
@@ -166,13 +176,21 @@ def transform_image(
 
 @router.delete("/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_image(
-    image_id: uuid.UUID, user: CurrentUser, db: DbSession, storage: StorageDep
+    image_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    storage: StorageDep,
+    cache: VariantCacheDep,
 ) -> None:
     """Delete an image. Images transformed from it are kept."""
     image = _get_owned_image(db, user, image_id)
     storage_key = image.storage_key
     db.delete(image)
     db.commit()
+    # After the commit, so a failed delete never drops a valid cache. Leftovers (Redis down,
+    # or a conversion racing the delete) can't be served, because the image lookup 404s first,
+    # and they expire with the TTL.
+    cache.invalidate(image_id)
     storage.delete(storage_key)
 
 

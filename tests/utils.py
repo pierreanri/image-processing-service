@@ -1,4 +1,5 @@
 import io
+import uuid
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -16,3 +17,19 @@ def make_image_bytes(
     buffer = io.BytesIO()
     Image.new(mode, size, color).save(buffer, format=fmt)
     return buffer.getvalue()
+
+
+class InMemoryVariantCache:
+    """Stand-in for app.cache.VariantCache that keeps entries in a dict."""
+
+    def __init__(self) -> None:
+        self.entries: dict[uuid.UUID, dict[str, bytes]] = {}
+
+    def get(self, image_id: uuid.UUID, variant: str) -> bytes | None:
+        return self.entries.get(image_id, {}).get(variant)
+
+    def set(self, image_id: uuid.UUID, variant: str, data: bytes) -> None:
+        self.entries.setdefault(image_id, {})[variant] = data
+
+    def invalidate(self, image_id: uuid.UUID) -> None:
+        self.entries.pop(image_id, None)

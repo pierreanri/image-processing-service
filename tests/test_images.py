@@ -4,6 +4,7 @@ import uuid
 import pytest
 from PIL import Image
 
+from app.cache import VariantCache, create_redis_client, get_variant_cache
 from app.config import get_settings
 from app.main import app
 from tests.utils import make_image_bytes, register
@@ -199,6 +200,114 @@ def test_content_rejects_unknown_format(client, auth_headers):
     response = client.get(image["url"], params={"format": "svg"}, headers=auth_headers)
 
     assert response.status_code == 422
+
+
+# --- Conversion cache -----------------------------------------------------------------------------
+
+
+def test_conversions_are_cached_per_format_and_quality(client, auth_headers, variant_cache):
+    image = uploaded(client, auth_headers)
+    image_id = uuid.UUID(image["id"])
+
+    responses = {
+        variant: client.get(image["url"], params=params, headers=auth_headers)
+        for variant, params in [
+            ("webp-qdefault", {"format": "webp"}),
+            ("jpeg-q40", {"format": "jpeg", "quality": 40}),
+            ("jpeg-qdefault", {"format": "jpg"}),
+        ]
+    }
+
+    assert set(variant_cache.entries[image_id]) == set(responses)
+    for variant, response in responses.items():
+        assert response.status_code == 200
+        assert variant_cache.entries[image_id][variant] == response.content
+        assert response.headers["etag"] == f'"{image_id.hex}-{variant}"'
+
+
+def test_lossless_conversions_share_one_entry_regardless_of_quality(
+    client, auth_headers, variant_cache
+):
+    image = uploaded(client, auth_headers, data=make_image_bytes("JPEG"), filename="a.jpg")
+    image_id = uuid.UUID(image["id"])
+
+    plain = client.get(image["url"], params={"format": "png"}, headers=auth_headers)
+    with_quality = client.get(
+        image["url"], params={"format": "png", "quality": 10}, headers=auth_headers
+    )
+
+    assert set(variant_cache.entries[image_id]) == {"png-qdefault"}
+    assert plain.headers["etag"] == with_quality.headers["etag"]
+    assert plain.content == with_quality.content
+
+
+def test_cached_conversion_is_served_without_reencoding(client, auth_headers, variant_cache):
+    image = uploaded(client, auth_headers)
+    image_id = uuid.UUID(image["id"])
+    variant_cache.set(image_id, "webp-qdefault", b"cached-bytes")
+
+    response = client.get(image["url"], params={"format": "webp"}, headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.content == b"cached-bytes"
+    assert response.headers["content-type"] == "image/webp"
+    assert response.headers["etag"] == f'"{image_id.hex}-webp-qdefault"'
+    assert "max-age" in response.headers["cache-control"]
+
+
+def test_originals_and_not_modified_responses_skip_the_cache(client, auth_headers, variant_cache):
+    image = uploaded(client, auth_headers)
+    etag = f'"{uuid.UUID(image["id"]).hex}-webp-qdefault"'
+
+    assert client.get(image["url"], headers=auth_headers).status_code == 200
+    assert (
+        client.get(image["url"], params={"format": "png"}, headers=auth_headers).status_code == 200
+    )
+    not_modified = client.get(
+        image["url"], params={"format": "webp"}, headers={**auth_headers, "If-None-Match": etag}
+    )
+
+    assert not_modified.status_code == 304
+    assert variant_cache.entries == {}
+
+
+def test_cached_conversions_are_hidden_from_other_users(client, auth_headers, variant_cache):
+    image = uploaded(client, auth_headers)
+    variant_cache.set(uuid.UUID(image["id"]), "webp-qdefault", b"alice's image")
+    bob = register(client, "bob")
+
+    response = client.get(image["url"], params={"format": "webp"}, headers=bob)
+
+    assert response.status_code == 404
+
+
+def test_delete_invalidates_cached_conversions(client, auth_headers, variant_cache):
+    image = uploaded(client, auth_headers)
+    client.get(image["url"], params={"format": "webp"}, headers=auth_headers)
+    assert uuid.UUID(image["id"]) in variant_cache.entries
+
+    assert client.delete(f"/images/{image['id']}", headers=auth_headers).status_code == 204
+
+    assert variant_cache.entries == {}
+    webp = client.get(image["url"], params={"format": "webp"}, headers=auth_headers)
+    assert webp.status_code == 404
+
+
+def test_conversions_and_delete_work_when_redis_is_down(client, auth_headers, closed_port):
+    down = VariantCache(
+        create_redis_client(f"redis://127.0.0.1:{closed_port}/0", 0.25),
+        ttl_seconds=60,
+        max_item_bytes=10**6,
+    )
+    app.dependency_overrides[get_variant_cache] = lambda: down
+    image = uploaded(client, auth_headers)
+
+    for _ in range(2):
+        response = client.get(image["url"], params={"format": "webp"}, headers=auth_headers)
+        assert response.status_code == 200
+        assert decode(response.content).format == "WEBP"
+    assert client.delete(f"/images/{image['id']}", headers=auth_headers).status_code == 204
+    assert client.get(image["url"], headers=auth_headers).status_code == 404
 
 
 # --- Transform ------------------------------------------------------------------------------------

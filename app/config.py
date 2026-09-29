@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     # Largest pixel count accepted on upload (guards against decompression bombs).
     max_image_pixels: int = Field(default=50_000_000, gt=0)
 
+    # Optional Redis cache for images converted on the fly; empty disables it.
+    redis_url: str = ""
+    redis_timeout_seconds: float = Field(default=0.25, gt=0)
+    cache_ttl_seconds: int = Field(default=24 * 60 * 60, gt=0)
+    # Converted images larger than this are served but not cached.
+    cache_max_item_bytes: int = Field(default=5 * 1024 * 1024, gt=0)
+
 
 @lru_cache
 def get_settings() -> Settings:

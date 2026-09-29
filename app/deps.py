@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import Depends
 from sqlalchemy.orm import Session
 
+from app.cache import VariantCache, get_variant_cache
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.models import User
@@ -13,3 +14,4 @@ DbSession = Annotated[Session, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 StorageDep = Annotated[LocalStorage, Depends(get_storage)]
+VariantCacheDep = Annotated[VariantCache, Depends(get_variant_cache)]
