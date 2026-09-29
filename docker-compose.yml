@@ -15,14 +15,35 @@ services:
       timeout: 3s
       retries: 10
 
+  # Cache for on-the-fly conversions: memory-capped, evicts least recently used, no persistence.
+  redis:
+    image: redis:7.2-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      # No password, so only reachable from this machine. Set REDIS_PORT if 6379 is taken.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+
   api:
     build: .
     depends_on:
       db:
         condition: service_healthy
+      # The API works without Redis (caching is best-effort), so it only waits for it to start.
+      redis:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql+psycopg://imgsvc:imgsvc@db:5432/imgsvc
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in your environment or in .env}
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - images:/data/storage
     ports:
