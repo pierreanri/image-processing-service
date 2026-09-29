@@ -117,6 +117,60 @@ def test_redis_errors_bypass_cache_during_cooldown(client, clock, caplog, error)
     assert cache_log_levels(caplog) == ["WARNING", "DEBUG", "INFO"]
 
 
+def test_success_of_a_call_started_before_a_failure_keeps_the_cooldown(client, clock, caplog):
+    caplog.set_level(logging.DEBUG, logger="app.cache")
+    cache = make_cache(client, clock=clock)
+
+    def hget(key, variant):
+        if variant == "slow-but-ok":
+            # While this call is in flight, another thread's call fails.
+            clock.advance(0.1)
+            assert cache.get(IMAGE_ID, "fails") is None
+            clock.advance(0.1)
+            return b"data"
+        raise redis.TimeoutError("Timeout reading from socket")
+
+    client.hget.side_effect = hget
+
+    assert cache.get(IMAGE_ID, "slow-but-ok") == b"data"
+    calls = client.hget.call_count
+    assert cache.get(IMAGE_ID, "next") is None
+    assert client.hget.call_count == calls
+    assert cache_log_levels(caplog) == ["WARNING"]
+
+
+def test_write_timeout_skips_the_item_without_a_cooldown(client, caplog):
+    caplog.set_level(logging.DEBUG, logger="app.cache")
+    pipeline_of(client).execute.side_effect = redis.TimeoutError("Timeout writing to socket")
+    client.hget.return_value = b"cached"
+    cache = make_cache(client)
+
+    cache.set(IMAGE_ID, "bmp-qdefault", b"x" * 100)
+
+    assert cache.get(IMAGE_ID, "webp-qdefault") == b"cached"
+    assert cache_log_levels(caplog) == ["DEBUG"]
+
+
+@pytest.mark.parametrize(
+    "error", [redis.exceptions.OutOfMemoryError, redis.exceptions.ReadOnlyError]
+)
+def test_rejected_writes_keep_reads_working_and_warn_once(client, caplog, error):
+    caplog.set_level(logging.DEBUG, logger="app.cache")
+    pipe = pipeline_of(client)
+    pipe.execute.side_effect = error("refused")
+    client.hget.return_value = b"cached"
+    cache = make_cache(client)
+
+    for _ in range(3):
+        cache.set(IMAGE_ID, "webp-qdefault", b"data")
+        assert cache.get(IMAGE_ID, "jpeg-q40") == b"cached"
+
+    assert client.hget.call_count == 3
+    pipe.execute.side_effect = None
+    cache.set(IMAGE_ID, "webp-qdefault", b"data")
+    assert cache_log_levels(caplog) == ["WARNING", "DEBUG", "DEBUG", "INFO"]
+
+
 def test_invalidate_is_attempted_during_cooldown(client, clock):
     cache = make_cache(client, clock=clock)
     client.hget.side_effect = redis.ConnectionError("boom")
@@ -149,7 +203,13 @@ def test_client_fails_fast():
 
 
 @pytest.mark.parametrize(
-    "url", ["http://localhost:6379/0", "redis://localhost:6379/0?decode_responses=True"]
+    "url",
+    [
+        "http://localhost:6379/0",
+        "redis://localhost:6379/0?decode_responses=True",
+        "redis://localhost:6379/0?socket_timout=1",  # misspelled option
+        "redis://localhost:6379/0?protocol=4",
+    ],
 )
 def test_client_rejects_unusable_urls(url):
     with pytest.raises(ValueError):
@@ -169,7 +229,7 @@ def test_refused_connection_is_fast_and_logged_once(closed_port, caplog):
     assert cache_log_levels(caplog) == ["WARNING"]
 
 
-def test_unresponsive_server_is_bounded_by_timeout():
+def test_unresponsive_server_is_bounded_by_timeout_and_not_retried():
     # A listening socket that never accepts: connections complete but nothing ever answers.
     with socket.socket() as server:
         server.bind(("127.0.0.1", 0))
@@ -180,3 +240,14 @@ def test_unresponsive_server_is_bounded_by_timeout():
         started = time.monotonic()
         assert cache.get(IMAGE_ID, "webp-qdefault") is None
         assert time.monotonic() - started < 1
+
+        # Every connection attempt is waiting in the backlog; a retried timeout would add one.
+        server.setblocking(False)
+        attempts = 0
+        while True:
+            try:
+                server.accept()[0].close()
+            except BlockingIOError:
+                break
+            attempts += 1
+        assert attempts == 1

@@ -112,11 +112,12 @@ def get_image_content(
     """
     image = _get_owned_image(db, user, image_id)
     target_format = format or image.format
-    serve_original = quality is None and target_format == image.format
-
-    # Lossless formats ignore quality, so all qualities share one ETag and cache entry. The
-    # variant token is both the ETag suffix and the cache field, so the two can't drift apart.
+    # Lossless formats ignore quality, so asking for one changes neither the bytes nor the ETag
+    # (and a lossless original is served as stored).
     effective_quality = quality if target_format in DEFAULT_QUALITY else None
+    serve_original = effective_quality is None and target_format == image.format
+
+    # The variant token is both the ETag suffix and the cache field, so they can't drift apart.
     variant = None if serve_original else f"{target_format}-q{effective_quality or 'default'}"
     etag = f'"{image.id.hex}"' if variant is None else f'"{image.id.hex}-{variant}"'
     headers = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
@@ -187,11 +188,11 @@ def delete_image(
     storage_key = image.storage_key
     db.delete(image)
     db.commit()
+    storage.delete(storage_key)
     # After the commit, so a failed delete never drops a valid cache. Leftovers (Redis down,
     # or a conversion racing the delete) can't be served, because the image lookup 404s first,
     # and they expire with the TTL.
     cache.invalidate(image_id)
-    storage.delete(storage_key)
 
 
 def _get_owned_image(db: DbSession, user: User, image_id: uuid.UUID) -> Image:

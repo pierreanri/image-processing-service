@@ -19,7 +19,7 @@ dependencies = [
     "pwdlib[argon2]>=0.2",
     "pydantic-settings>=2.4",
     "python-multipart>=0.0.9",
-    "redis>=5.0",
+    "redis>=6.0",
 ]
 
 [project.optional-dependencies]

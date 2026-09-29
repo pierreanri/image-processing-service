@@ -24,8 +24,10 @@ class InMemoryVariantCache:
 
     def __init__(self) -> None:
         self.entries: dict[uuid.UUID, dict[str, bytes]] = {}
+        self.reads: list[tuple[uuid.UUID, str]] = []
 
     def get(self, image_id: uuid.UUID, variant: str) -> bytes | None:
+        self.reads.append((image_id, variant))
         return self.entries.get(image_id, {}).get(variant)
 
     def set(self, image_id: uuid.UUID, variant: str, data: bytes) -> None:

@@ -65,13 +65,14 @@ Settings come from environment variables or a `.env` file.
 | `MAX_DIMENSION` | `10000` | Largest width/height a transformation may produce |
 | `MAX_IMAGE_PIXELS` | `50000000` | Largest pixel count accepted on upload |
 | `REDIS_URL` | *(empty: cache off)* | Redis for the conversion cache: `redis://`, `rediss://` (TLS) or `unix://` |
-| `REDIS_TIMEOUT_SECONDS` | `0.25` | Connect and read timeout for each Redis call |
+| `REDIS_TIMEOUT_SECONDS` | `0.25` | Timeout for connecting to Redis and for each read or write |
 | `CACHE_TTL_SECONDS` | `86400` (1 day) | How long an image's cached conversions live after the last one was added |
 | `CACHE_MAX_ITEM_BYTES` | `5242880` (5 MB) | Conversions larger than this are served but not cached |
 
 Options in the query string of `REDIS_URL` override the client settings; don't set
-`decode_responses` there (the app refuses to start if you do). An unsupported scheme, a bad port or
-a bad option value in `REDIS_URL` also stops startup, but an unreachable Redis does not.
+`decode_responses` there (the app refuses to start if you do). An unsupported scheme, a bad port,
+or an unknown or invalid option in `REDIS_URL` also stops startup, but an unreachable Redis does
+not.
 
 ### Tests and linting
 
@@ -211,11 +212,19 @@ Unknown keys are rejected with `422`, so a typo never silently does nothing.
 - **Cache memory**: the TTL is refreshed whenever a conversion is added, entries over
   `CACHE_MAX_ITEM_BYTES` are skipped, and the total is bounded by Redis itself. Run Redis with
   `maxmemory` and `allkeys-lru` (or `volatile-lru` on a shared instance, since every key has a
-  TTL). With `noeviction` the cache is effectively disabled once full.
-- **Cache failures fail open**: a Redis error is logged once, treated as a miss, and Redis is then
-  skipped for 5 seconds: during an outage a request pays at most one short timeout, and requests
-  during the cooldown pay none. `REDIS_TIMEOUT_SECONDS` bounds each call; resolving a hostname is not
-  covered, so point `REDIS_URL` at an IP or a reliable resolver for a remote Redis.
+  TTL). With `noeviction`, new conversions stop being cached once it is full.
+- **Cache failures fail open**, and a conversion is always served:
+  - Redis unreachable or not answering in time: one warning per outage, and Redis is skipped for
+    5 seconds (except by deletes, which still try to drop cached data), so an outage doesn't add a
+    timeout to every request.
+  - Redis answering but refusing writes (full under `noeviction`, or a read-only replica): one
+    warning; cached conversions are still served, new ones are not cached.
+  - A write that times out (a large conversion on a slow link) is simply not cached.
+- **Cache timeouts**: `REDIS_TIMEOUT_SECONDS` bounds each connection attempt, read and write. A
+  hostname with several addresses is tried one address at a time, and name resolution isn't
+  covered, so point `REDIS_URL` at an IP or a reliable resolver for a remote Redis. The timeout must
+  also cover sending `CACHE_MAX_ITEM_BYTES` to Redis (5 MB in 0.25 s needs about 200 Mbit/s); for
+  a remote Redis, raise the timeout or lower the cap.
 - **Cache security**: whoever can write to Redis can change the bytes the API serves. Keep it on a
   private network, require a password or ACL, and use `rediss://` across untrusted networks.
 

@@ -268,7 +268,20 @@ def test_originals_and_not_modified_responses_skip_the_cache(client, auth_header
     )
 
     assert not_modified.status_code == 304
+    assert variant_cache.reads == []
     assert variant_cache.entries == {}
+
+
+def test_quality_is_ignored_for_lossless_originals(client, auth_headers, variant_cache):
+    data = make_image_bytes("PNG")
+    image = uploaded(client, auth_headers, data=data)
+
+    response = client.get(image["url"], params={"quality": 10}, headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.content == data
+    assert response.headers["etag"] == f'"{uuid.UUID(image["id"]).hex}"'
+    assert variant_cache.reads == []
 
 
 def test_cached_conversions_are_hidden_from_other_users(client, auth_headers, variant_cache):
