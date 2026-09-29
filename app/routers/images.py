@@ -107,9 +107,11 @@ def get_image_content(
 ) -> Response:
     """Download an image, optionally converted to another format or quality."""
     image = _get_owned_image(db, user, image_id)
-    serve_original = quality is None and format in (None, image.format)
+    target_format = format or image.format
+    serve_original = quality is None and target_format == image.format
 
-    etag = f'"{image.id.hex}"' if serve_original else f'"{image.id.hex}-{format}-{quality}"'
+    variant = "" if serve_original else f"-{target_format}-q{quality or 'default'}"
+    etag = f'"{image.id.hex}{variant}"'
     headers = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
     if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
@@ -122,7 +124,7 @@ def get_image_content(
     loaded = load_image(storage.read(image.storage_key), settings.max_image_pixels)
     result = apply_transformations(
         loaded,
-        TransformationSpec(format=format or image.format, quality=quality),
+        TransformationSpec(format=target_format, quality=quality),
         settings.max_dimension,
     )
     return Response(result.data, media_type=result.mime_type, headers=headers)

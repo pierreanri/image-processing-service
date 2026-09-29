@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: imgsvc
+      POSTGRES_PASSWORD: imgsvc
+      POSTGRES_DB: imgsvc
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imgsvc -d imgsvc"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://imgsvc:imgsvc@db:5432/imgsvc
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in your environment or in .env}
+    volumes:
+      - images:/data/storage
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
+  images:
