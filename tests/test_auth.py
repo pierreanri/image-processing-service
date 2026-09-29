@@ -1,6 +1,6 @@
 import pytest
 
-from tests.conftest import register
+from tests.utils import register
 
 
 def test_register_returns_user_and_token(client):

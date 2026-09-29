@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 
 class RegisterRequest(BaseModel):
@@ -30,3 +31,98 @@ class TokenResponse(BaseModel):
 
 class RegisterResponse(TokenResponse):
     user: UserOut
+
+
+# --- Images -------------------------------------------------------------------------------------
+
+FORMAT_ALIASES = {"jpg": "jpeg", "tif": "tiff"}
+
+
+def _normalize_format(value: object) -> object:
+    if isinstance(value, str):
+        value = value.strip().lower()
+        return FORMAT_ALIASES.get(value, value)
+    return value
+
+
+ImageFormat = Annotated[
+    Literal["jpeg", "png", "webp", "gif", "bmp", "tiff"], BeforeValidator(_normalize_format)
+]
+
+
+class StrictModel(BaseModel):
+    # Reject unknown keys so typos like "grayscal" fail loudly instead of being ignored.
+    model_config = ConfigDict(extra="forbid")
+
+
+class CropSpec(StrictModel):
+    x: int = Field(default=0, ge=0)
+    y: int = Field(default=0, ge=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+
+class ResizeSpec(StrictModel):
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    fit: Literal["fill", "contain", "cover"] = Field(
+        default="fill",
+        description=(
+            "Only used when both width and height are given. fill: stretch to the exact size; "
+            "contain: scale to fit inside the box, keeping aspect ratio; cover: scale and "
+            "center-crop to exactly fill the box."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _require_a_dimension(self) -> "ResizeSpec":
+        if self.width is None and self.height is None:
+            raise ValueError("resize needs width, height or both")
+        return self
+
+
+class FiltersSpec(StrictModel):
+    grayscale: bool = False
+    sepia: bool = False
+    blur: float | None = Field(default=None, gt=0, le=50, description="Gaussian blur radius.")
+    sharpen: bool = False
+
+
+class WatermarkSpec(StrictModel):
+    text: str = Field(min_length=1, max_length=100)
+    position: Literal["top-left", "top-right", "bottom-left", "bottom-right", "center"] = (
+        "bottom-right"
+    )
+    opacity: float = Field(default=0.5, ge=0, le=1)
+    size: int | None = Field(
+        default=None, ge=8, le=500, description="Font size in px; scales with the image if unset."
+    )
+
+
+class TransformationSpec(StrictModel):
+    """Transformations are applied in this order: crop, resize, rotate, flip, mirror, filters,
+    watermark; the result is then encoded with `format` and `quality`."""
+
+    crop: CropSpec | None = None
+    resize: ResizeSpec | None = None
+    rotate: float | None = Field(default=None, ge=-360, le=360, description="Degrees, clockwise.")
+    flip: bool = Field(default=False, description="Flip vertically (top to bottom).")
+    mirror: bool = Field(default=False, description="Mirror horizontally (left to right).")
+    filters: FiltersSpec | None = None
+    watermark: WatermarkSpec | None = None
+    format: ImageFormat | None = Field(
+        default=None, description="Output format; defaults to the source format."
+    )
+    quality: int | None = Field(
+        default=None, ge=1, le=100, description="Compression quality for JPEG and WebP."
+    )
+
+    @model_validator(mode="after")
+    def _require_an_operation(self) -> "TransformationSpec":
+        if not self.model_dump(exclude_defaults=True):
+            raise ValueError("at least one transformation is required")
+        return self
+
+
+class TransformRequest(StrictModel):
+    transformations: TransformationSpec
