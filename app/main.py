@@ -1,10 +1,12 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.routers import auth
+from app.imaging import ImageProcessingError
+from app.routers import auth, images
 
 
 @asynccontextmanager
@@ -22,6 +24,11 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(auth.router)
+    app.include_router(images.router)
+
+    @app.exception_handler(ImageProcessingError)
+    async def image_processing_error(request: Request, exc: ImageProcessingError) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
 
     @app.get("/health", tags=["health"])
     def health() -> dict[str, str]:

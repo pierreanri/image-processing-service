@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
@@ -126,3 +126,29 @@ class TransformationSpec(StrictModel):
 
 class TransformRequest(StrictModel):
     transformations: TransformationSpec
+
+
+class ImageOut(BaseModel):
+    id: uuid.UUID
+    parent_id: uuid.UUID | None = Field(
+        description="The image this one was transformed from, if any."
+    )
+    url: str = Field(description="Where to download the image bytes.")
+    original_filename: str
+    format: str
+    mime_type: str
+    width: int
+    height: int
+    size_bytes: int
+    transformations: dict[str, Any] | None = Field(
+        description="The transformations that produced this image, if any."
+    )
+    created_at: datetime
+
+
+class ImageList(BaseModel):
+    items: list[ImageOut]
+    page: int
+    limit: int
+    total: int
+    pages: int

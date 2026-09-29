@@ -12,6 +12,7 @@ from sqlalchemy import text  # noqa: E402
 
 from app.db import Base, get_engine  # noqa: E402
 from app.main import app  # noqa: E402
+from app.storage import LocalStorage, get_storage  # noqa: E402
 from tests.utils import register  # noqa: E402
 
 
@@ -33,7 +34,13 @@ def clean_db(engine):
 
 
 @pytest.fixture
-def client(clean_db):
+def storage(tmp_path) -> LocalStorage:
+    return LocalStorage(tmp_path / "storage")
+
+
+@pytest.fixture
+def client(clean_db, storage):
+    app.dependency_overrides[get_storage] = lambda: storage
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
