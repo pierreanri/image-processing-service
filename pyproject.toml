@@ -43,3 +43,7 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.File"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # Starlette's TestClient nudges towards a different HTTP client package; httpx works fine.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
