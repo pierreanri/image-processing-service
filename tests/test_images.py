@@ -1,13 +1,16 @@
 import io
+import logging
 import uuid
 
 import pytest
 from PIL import Image
 
-from app.cache import VariantCache, create_redis_client, get_variant_cache
+from app.cache import VariantCache, get_variant_cache
 from app.config import get_settings
 from app.main import app
-from tests.utils import make_image_bytes, register
+from app.ratelimit import Limit, RateLimiter, get_transform_rate_limiter
+from app.redis_client import create_redis_client
+from tests.utils import ALLOWED, REJECTED, make_image_bytes, register, user_id_of
 
 
 def upload(client, headers, data=None, filename="photo.png", content_type="image/png"):
@@ -462,3 +465,142 @@ def test_delete_keeps_derived_images(client, auth_headers):
     assert remaining.status_code == 200
     assert remaining.json()["parent_id"] is None
     assert client.get(remaining.json()["url"], headers=auth_headers).status_code == 200
+
+
+# --- Rate limiting --------------------------------------------------------------------------------
+
+RATE_LIMIT_HEADERS = ("ratelimit", "ratelimit-policy", "retry-after")
+
+
+def transform(client, headers, image_id, transformations=None):
+    return client.post(
+        f"/images/{image_id}/transform",
+        headers=headers,
+        json={"transformations": transformations or {"flip": True}},
+    )
+
+
+def test_transform_counts_the_caller_once_and_sends_rate_limit_headers(
+    client, auth_headers, rate_limiter
+):
+    rate_limiter.decision = ALLOWED
+    image = uploaded(client, auth_headers)
+
+    response = transform(client, auth_headers, image["id"])
+
+    assert response.status_code == 201
+    assert response.headers["ratelimit-policy"] == ALLOWED.headers()["RateLimit-Policy"]
+    assert response.headers["ratelimit"] == ALLOWED.headers()["RateLimit"]
+    assert "retry-after" not in response.headers
+    assert rate_limiter.hits == [user_id_of(auth_headers)]
+
+
+def test_rate_limited_transform_is_429_and_creates_nothing(
+    client, auth_headers, rate_limiter, storage
+):
+    image = uploaded(client, auth_headers)
+    rate_limiter.decision = REJECTED
+
+    response = transform(client, auth_headers, image["id"])
+
+    assert response.status_code == 429
+    assert response.json() == {
+        "detail": "Too many transformations (limit: 30 per minute); retry in 13s"
+    }
+    assert response.headers["retry-after"] == "13"
+    assert response.headers["ratelimit-policy"] == REJECTED.headers()["RateLimit-Policy"]
+    assert response.headers["ratelimit"] == REJECTED.headers()["RateLimit"]
+    assert client.get("/images", headers=auth_headers).json()["total"] == 1
+    assert len([path for path in storage.root.rglob("*") if path.is_file()]) == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status"),
+    [
+        ("no token", 401),
+        ("invalid token", 401),
+        ("malformed JSON", 422),
+        ("no transformations", 422),
+        ("invalid transformation", 422),
+        ("invalid image id", 422),
+        ("unknown image", 404),
+        ("another user's image", 404),
+    ],
+)
+def test_limit_is_checked_after_auth_validation_and_ownership(
+    client, auth_headers, rate_limiter, case, expected_status
+):
+    rate_limiter.decision = REJECTED
+    image = uploaded(client, auth_headers)
+    url = f"/images/{image['id']}/transform"
+    request = {"headers": auth_headers, "json": {"transformations": {"flip": True}}}
+    if case == "no token":
+        request["headers"] = {}
+    elif case == "invalid token":
+        request["headers"] = {"Authorization": "Bearer not-a-token"}
+    elif case == "malformed JSON":
+        request = {
+            "headers": {**auth_headers, "Content-Type": "application/json"},
+            "content": b"{",
+        }
+    elif case == "no transformations":
+        request["json"] = {"transformations": {}}
+    elif case == "invalid transformation":
+        request["json"] = {"transformations": {"rotate": 720}}
+    elif case == "invalid image id":
+        url = "/images/not-a-uuid/transform"
+    elif case == "unknown image":
+        url = f"/images/{uuid.uuid4()}/transform"
+    elif case == "another user's image":
+        request["headers"] = register(client, "bob")
+
+    response = client.post(url, **request)
+
+    assert response.status_code == expected_status
+    if case == "malformed JSON":
+        assert response.json()["detail"][0]["type"] == "json_invalid"
+    assert rate_limiter.hits == []
+
+
+def test_failed_transformation_still_counts(client, auth_headers, rate_limiter):
+    image = uploaded(client, auth_headers, data=make_image_bytes(size=(100, 50)))
+
+    response = transform(
+        client, auth_headers, image["id"], {"crop": {"x": 90, "width": 50, "height": 10}}
+    )
+
+    assert response.status_code == 422
+    assert len(rate_limiter.hits) == 1
+
+
+def test_unchecked_transform_has_no_rate_limit_headers(client, auth_headers):
+    image = uploaded(client, auth_headers)
+
+    response = transform(client, auth_headers, image["id"])
+
+    assert response.status_code == 201
+    assert not set(RATE_LIMIT_HEADERS) & set(response.headers)
+
+
+def test_transform_works_when_redis_is_down(client, auth_headers, closed_port, caplog):
+    caplog.set_level(logging.WARNING, logger="app.ratelimit")
+    limiter = RateLimiter(
+        create_redis_client(f"redis://127.0.0.1:{closed_port}/0", 0.25), (Limit("minute", 1, 60),)
+    )
+    app.dependency_overrides[get_transform_rate_limiter] = lambda: limiter
+    image = uploaded(client, auth_headers)
+
+    for _ in range(2):
+        response = transform(client, auth_headers, image["id"])
+        assert response.status_code == 201
+        assert not set(RATE_LIMIT_HEADERS) & set(response.headers)
+
+    warnings = [record.getMessage() for record in caplog.records if record.name == "app.ratelimit"]
+    assert len(warnings) == 1
+    assert warnings[0].startswith("Transform rate limiter unavailable (ConnectionError")
+
+
+def test_openapi_documents_rate_limit_response():
+    responses = app.openapi()["paths"]["/images/{image_id}/transform"]["post"]["responses"]
+
+    assert "Retry-After" in responses["429"]["headers"]

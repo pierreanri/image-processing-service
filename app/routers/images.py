@@ -7,9 +7,17 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, Response, Up
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
-from app.deps import CurrentUser, DbSession, SettingsDep, StorageDep, VariantCacheDep
+from app.deps import (
+    CurrentUser,
+    DbSession,
+    SettingsDep,
+    StorageDep,
+    TransformRateLimiterDep,
+    VariantCacheDep,
+)
 from app.imaging import DEFAULT_QUALITY, FORMATS, apply_transformations, load_image
 from app.models import Image, User
+from app.ratelimit import RateLimitDecision
 from app.schemas import ImageFormat, ImageList, ImageOut, TransformationSpec, TransformRequest
 from app.storage import LocalStorage, build_key
 
@@ -141,21 +149,46 @@ def get_image_content(
     return Response(data, media_type=FORMATS[target_format].mime_type, headers=headers)
 
 
-@router.post("/{image_id}/transform", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{image_id}/transform",
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        429: {
+            "description": "Too many transformations; retry after `Retry-After` seconds.",
+            "headers": {
+                "Retry-After": {
+                    "description": "Seconds to wait before retrying.",
+                    "schema": {"type": "integer"},
+                }
+            },
+        }
+    },
+)
 def transform_image(
     image_id: uuid.UUID,
     body: TransformRequest,
     request: Request,
+    response: Response,
     user: CurrentUser,
     db: DbSession,
     storage: StorageDep,
     settings: SettingsDep,
+    rate_limiter: TransformRateLimiterDep,
 ) -> ImageOut:
     """Apply transformations to an image and save the result as a new image.
 
     The source image is left untouched; the new image records it as its `parent_id`.
+    Transformations are rate limited per user (by default 30 per minute and 500 per hour);
+    over a limit the response is 429 with `Retry-After`.
     """
     source = _get_owned_image(db, user, image_id)
+    # Counted only once the request is authenticated, valid and about the user's own image
+    # (so 401/422/404 never use quota); a transformation that fails after this still counts.
+    decision = rate_limiter.hit(user.id)
+    if not decision.allowed:
+        raise _too_many_transformations(decision)
+    response.headers.update(decision.headers())
+
     loaded = load_image(storage.read(source.storage_key), settings.max_image_pixels)
     result = apply_transformations(loaded, body.transformations, settings.max_dimension)
 
@@ -193,6 +226,15 @@ def delete_image(
     # or a conversion racing the delete) can't be served, because the image lookup 404s first,
     # and they expire with the TTL.
     cache.invalidate(image_id)
+
+
+def _too_many_transformations(decision: RateLimitDecision) -> HTTPException:
+    limits = " and ".join(f"{s.limit.requests} per {s.limit.name}" for s in decision.exceeded)
+    return HTTPException(
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        f"Too many transformations (limit: {limits}); retry in {decision.retry_after_seconds}s",
+        headers=decision.headers(),
+    )
 
 
 def _get_owned_image(db: DbSession, user: User, image_id: uuid.UUID) -> Image:

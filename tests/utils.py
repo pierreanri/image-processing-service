@@ -1,14 +1,22 @@
 import io
 import uuid
 
+import jwt
 from fastapi.testclient import TestClient
 from PIL import Image
+
+from app.ratelimit import UNCHECKED, Limit, LimitState, RateLimitDecision
 
 
 def register(client: TestClient, username: str = "alice", password: str = "password123") -> dict:
     response = client.post("/register", json={"username": username, "password": password})
     assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def user_id_of(headers: dict) -> uuid.UUID:
+    token = headers["Authorization"].removeprefix("Bearer ")
+    return uuid.UUID(jwt.decode(token, options={"verify_signature": False})["sub"])
 
 
 def make_image_bytes(
@@ -35,3 +43,33 @@ class InMemoryVariantCache:
 
     def invalidate(self, image_id: uuid.UUID) -> None:
         self.entries.pop(image_id, None)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+MINUTE = Limit("minute", 30, 60)
+HOUR = Limit("hour", 500, 3600)
+ALLOWED = RateLimitDecision(True, (LimitState(MINUTE, 29, 60), LimitState(HOUR, 499, 3600)))
+REJECTED = RateLimitDecision(False, (LimitState(MINUTE, 0, 13), LimitState(HOUR, 470, 2811)))
+
+
+class FakeRateLimiter:
+    """Stand-in for app.ratelimit.RateLimiter that records who was counted and returns a
+    canned decision."""
+
+    def __init__(self, decision: RateLimitDecision = UNCHECKED) -> None:
+        self.decision = decision
+        self.hits: list[uuid.UUID] = []
+
+    def hit(self, user_id: uuid.UUID) -> RateLimitDecision:
+        self.hits.append(user_id)
+        return self.decision

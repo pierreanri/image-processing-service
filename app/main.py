@@ -7,15 +7,17 @@ from fastapi.responses import JSONResponse
 from app.cache import get_variant_cache
 from app.config import get_settings
 from app.imaging import ImageProcessingError
+from app.ratelimit import get_transform_rate_limiter
 from app.routers import auth, images
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail fast on missing/invalid configuration instead of on the first request.
-    # (Building the cache client parses REDIS_URL but does not connect.)
+    # (Building the Redis client parses REDIS_URL but does not connect.)
     get_settings()
     get_variant_cache()
+    get_transform_rate_limiter()
     yield
 
 

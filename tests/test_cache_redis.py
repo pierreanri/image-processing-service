@@ -1,29 +1,14 @@
 """VariantCache against a real Redis server; skipped when none is reachable.
 
-Uses TEST_REDIS_URL (default redis://localhost:6379/15). Each test only touches keys for a fresh
-random image id and deletes them afterwards; the database is never flushed.
+Uses the redis_client fixture (TEST_REDIS_URL, default redis://localhost:6379/15). Each test only
+touches keys for a fresh random image id and deletes them afterwards; the database is never flushed.
 """
 
-import os
 import uuid
 
 import pytest
-import redis
 
-from app.cache import KEY_PREFIX, VariantCache, create_redis_client
-
-TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
-
-
-@pytest.fixture(scope="module")
-def redis_client():
-    client = create_redis_client(TEST_REDIS_URL, 0.5)
-    try:
-        client.ping()
-    except redis.RedisError as exc:
-        pytest.skip(f"Redis not reachable at {TEST_REDIS_URL}: {exc}")
-    yield client
-    client.close()
+from app.cache import KEY_PREFIX, VariantCache
 
 
 @pytest.fixture

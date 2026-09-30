@@ -7,6 +7,7 @@ from app.cache import VariantCache, get_variant_cache
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.models import User
+from app.ratelimit import RateLimiter, get_transform_rate_limiter
 from app.security import get_current_user
 from app.storage import LocalStorage, get_storage
 
@@ -15,3 +16,4 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 StorageDep = Annotated[LocalStorage, Depends(get_storage)]
 VariantCacheDep = Annotated[VariantCache, Depends(get_variant_cache)]
+TransformRateLimiterDep = Annotated[RateLimiter, Depends(get_transform_rate_limiter)]

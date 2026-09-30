@@ -7,31 +7,16 @@ from unittest.mock import MagicMock
 import pytest
 import redis
 
-from app.cache import KEY_PREFIX, VariantCache, create_redis_client
+from app.cache import KEY_PREFIX, VariantCache
+from app.redis_client import create_redis_client
 
 IMAGE_ID = uuid.uuid4()
 KEY = f"{KEY_PREFIX}:{IMAGE_ID.hex}"
 
 
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
-
 @pytest.fixture
 def client():
     return MagicMock(spec=redis.Redis)
-
-
-@pytest.fixture
-def clock():
-    return FakeClock()
 
 
 def make_cache(client, **kwargs) -> VariantCache:
