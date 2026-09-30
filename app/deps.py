@@ -9,11 +9,11 @@ from app.db import get_db
 from app.models import User
 from app.ratelimit import RateLimiter, get_transform_rate_limiter
 from app.security import get_current_user
-from app.storage import LocalStorage, get_storage
+from app.storage import Storage, get_storage
 
 DbSession = Annotated[Session, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
-StorageDep = Annotated[LocalStorage, Depends(get_storage)]
+StorageDep = Annotated[Storage, Depends(get_storage)]
 VariantCacheDep = Annotated[VariantCache, Depends(get_variant_cache)]
 TransformRateLimiterDep = Annotated[RateLimiter, Depends(get_transform_rate_limiter)]

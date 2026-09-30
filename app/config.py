@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,7 +18,16 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = Field(default=60, gt=0)
 
+    # Where image files are kept: "local" (STORAGE_DIR) or "s3" (the S3_* settings).
+    storage_backend: Literal["local", "s3"] = "local"
     storage_dir: Path = Path("./storage")
+    # For STORAGE_BACKEND=s3. Empty values use boto3's defaults: AWS's endpoint, and the region
+    # and credentials from its usual chain (AWS_* variables, ~/.aws, instance or task roles).
+    s3_bucket: str = ""
+    s3_endpoint_url: str = ""
+    s3_region: str = ""
+    s3_access_key_id: str = ""
+    s3_secret_access_key: str = ""
 
     max_upload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     # Largest width/height a transformation may produce.

@@ -1,0 +1,368 @@
+import base64
+import hashlib
+import os
+import uuid
+from unittest.mock import MagicMock
+
+import botocore.exceptions
+import pytest
+import sqlalchemy.orm
+from pydantic import ValidationError
+
+from app.config import Settings
+from app.storage import (
+    CHUNK_SIZE,
+    FileStream,
+    LocalStorage,
+    StorageUnavailableError,
+    build_storage,
+)
+from app.storage_s3 import S3Storage, create_s3_client
+from tests.utils import make_image_bytes, stored_keys
+
+KEY = f"{uuid.uuid4()}/{uuid.uuid4().hex}.png"
+
+
+@pytest.fixture(params=["local", "s3"])
+def any_storage(request):
+    return request.getfixturevalue(f"{request.param}_storage")
+
+
+def s3_settings(**overrides) -> Settings:
+    values = {
+        "storage_backend": "s3",
+        "s3_bucket": "imgsvc",
+        "s3_region": "us-east-1",
+        "s3_access_key_id": "testing",
+        "s3_secret_access_key": "testing",
+    }
+    return Settings(_env_file=None, **(values | overrides))
+
+
+def client_error(code: str, status: int) -> botocore.exceptions.ClientError:
+    response = {
+        "Error": {"Code": code, "Message": code},
+        "ResponseMetadata": {"HTTPStatusCode": status},
+    }
+    return botocore.exceptions.ClientError(response, "Operation")
+
+
+# --- The storage contract, on both backends -------------------------------------------------------
+
+
+def test_saved_data_reads_back(any_storage):
+    data = bytes(range(256)) * 1024
+
+    any_storage.save(KEY, data, content_type="image/png")
+
+    assert any_storage.read(KEY) == data
+    assert stored_keys(any_storage) == [KEY]
+
+
+def test_open_streams_the_size_and_the_data_in_chunks(any_storage):
+    data = os.urandom(2 * CHUNK_SIZE + 1)
+    any_storage.save(KEY, data, content_type="image/png")
+
+    file = any_storage.open(KEY)
+    chunks = list(file)
+
+    assert file.size == len(data)
+    assert b"".join(chunks) == data
+    assert all(0 < len(chunk) <= CHUNK_SIZE for chunk in chunks)
+    file.close()  # closing again is harmless
+
+
+def test_delete_removes_the_file_and_ignores_missing_keys(any_storage):
+    any_storage.save(KEY, b"data", content_type="image/png")
+
+    any_storage.delete(KEY)
+    any_storage.delete(KEY)
+
+    assert stored_keys(any_storage) == []
+
+
+def test_a_missing_file_is_an_error_not_an_outage(any_storage):
+    for operation in (any_storage.read, any_storage.open):
+        with pytest.raises(Exception) as error:
+            operation(KEY)
+        assert not isinstance(error.value, StorageUnavailableError)
+
+
+# --- S3 specifics (moto) --------------------------------------------------------------------------
+
+
+def test_objects_are_stored_under_their_key_with_their_type(s3_storage):
+    s3_storage.save("owner/abc.png", make_image_bytes(), content_type="image/png")
+
+    assert stored_keys(s3_storage) == ["owner/abc.png"]
+    head = s3_storage.client.head_object(Bucket=s3_storage.bucket, Key="owner/abc.png")
+    assert head["ContentType"] == "image/png"
+
+
+def test_uploads_send_a_content_md5_and_no_aws_chunked_checksums(s3_storage):
+    # Third-party S3 servers often reject boto3's default aws-chunked CRC32 trailers.
+    sent = []
+
+    def capture(request, **kwargs):
+        sent.append(dict(request.headers))
+
+    events = s3_storage.client.meta.events
+    events.register("before-send.s3.PutObject", capture)
+    try:
+        data = make_image_bytes()
+        s3_storage.save(KEY, data, content_type="image/png")
+    finally:
+        events.unregister("before-send.s3.PutObject", capture)
+
+    headers = {
+        name.lower(): value.decode() if isinstance(value, bytes) else value
+        for name, value in sent[0].items()
+    }
+    expected_md5 = base64.b64encode(hashlib.md5(data).digest()).decode()
+    assert headers["content-md5"] == expected_md5
+    assert headers["content-type"] == "image/png"
+    assert not [
+        name for name in headers if name.startswith(("x-amz-checksum", "x-amz-sdk-checksum"))
+    ]
+    assert "x-amz-trailer" not in headers
+    assert headers.get("content-encoding") != "aws-chunked"
+
+
+def test_client_is_configured_to_fail_fast_and_stay_compatible():
+    config = create_s3_client(s3_settings()).meta.config
+
+    assert (config.connect_timeout, config.read_timeout) == (2, 10)
+    assert config.retries == {"mode": "standard", "total_max_attempts": 3}
+    assert config.max_pool_connections == 64
+    assert config.request_checksum_calculation == "when_required"
+    assert config.response_checksum_validation == "when_required"
+
+
+def test_endpoint_variables_from_the_environment_are_ignored(monkeypatch):
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://elsewhere:1")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://elsewhere:2")
+
+    client = create_s3_client(s3_settings())
+
+    assert client.meta.endpoint_url == "https://s3.amazonaws.com"
+
+
+def test_custom_endpoints_get_path_style_urls():
+    client = create_s3_client(s3_settings(s3_endpoint_url="http://s3:8333"))
+
+    url = client.generate_presigned_url("get_object", Params={"Bucket": "imgsvc", "Key": "a/b.png"})
+
+    assert url.startswith("http://s3:8333/imgsvc/a/b.png?")
+
+
+# --- S3 error mapping -----------------------------------------------------------------------------
+
+
+def call(storage: S3Storage, operation: str):
+    if operation == "save":
+        return storage.save(KEY, b"data", content_type="image/png")
+    return getattr(storage, operation)(KEY)
+
+
+@pytest.mark.parametrize("operation", ["save", "read", "open", "delete"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        botocore.exceptions.EndpointConnectionError(endpoint_url="http://s3"),
+        botocore.exceptions.ConnectTimeoutError(endpoint_url="http://s3"),
+        botocore.exceptions.ReadTimeoutError(endpoint_url="http://s3"),
+        botocore.exceptions.ResponseStreamingError(error="connection reset"),
+        botocore.exceptions.IncompleteReadError(actual_bytes=1, expected_bytes=2),
+        client_error("SlowDown", 503),
+        client_error("InternalError", 500),
+        client_error("TooManyRequests", 429),
+        client_error("RequestTimeout", 400),
+    ],
+    ids=lambda error: (
+        type(error).__name__
+        if not isinstance(error, botocore.exceptions.ClientError)
+        else error.response["Error"]["Code"]
+    ),
+)
+def test_transient_errors_mean_storage_is_unavailable(operation, error):
+    client = MagicMock()
+    for method in ("put_object", "get_object", "delete_object"):
+        getattr(client, method).side_effect = error
+
+    with pytest.raises(StorageUnavailableError) as raised:
+        call(S3Storage(client, "imgsvc"), operation)
+
+    assert raised.value.__cause__ is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        client_error("NoSuchKey", 404),
+        client_error("NoSuchBucket", 404),
+        client_error("AccessDenied", 403),
+        client_error("InvalidAccessKeyId", 403),
+        botocore.exceptions.NoCredentialsError(),
+    ],
+    ids=lambda error: (
+        type(error).__name__
+        if not isinstance(error, botocore.exceptions.ClientError)
+        else error.response["Error"]["Code"]
+    ),
+)
+def test_other_errors_are_raised_unchanged(error):
+    client = MagicMock()
+    client.get_object.side_effect = error
+
+    with pytest.raises(type(error)) as raised:
+        S3Storage(client, "imgsvc").read(KEY)
+
+    assert raised.value is error
+
+
+# --- Configuration --------------------------------------------------------------------------------
+
+
+def test_local_disk_is_the_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("STORAGE_BACKEND")
+
+    storage = build_storage(Settings(_env_file=None, storage_dir=tmp_path))
+
+    assert isinstance(storage, LocalStorage)
+    assert storage.root == tmp_path.resolve()
+
+
+def test_s3_backend_is_built_from_the_settings():
+    storage = build_storage(s3_settings(s3_endpoint_url="http://s3:8333"))
+
+    assert isinstance(storage, S3Storage)
+    assert storage.bucket == "imgsvc"
+    assert storage.client.meta.endpoint_url == "http://s3:8333"
+
+
+def test_s3_backend_requires_a_bucket():
+    with pytest.raises(ValueError, match="S3_BUCKET"):
+        build_storage(s3_settings(s3_bucket=""))
+
+
+def test_unknown_backends_are_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, storage_backend="gcs")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"s3_endpoint_url": "s3:8333"}, ValueError),
+        ({"s3_secret_access_key": ""}, botocore.exceptions.PartialCredentialsError),
+    ],
+)
+def test_bad_s3_settings_fail_when_the_client_is_built(overrides, error):
+    with pytest.raises(error):
+        build_storage(s3_settings(**overrides))
+
+
+def test_building_s3_storage_sends_no_request(closed_port):
+    # Nothing listens there, so any request would fail.
+    storage = build_storage(s3_settings(s3_endpoint_url=f"http://127.0.0.1:{closed_port}"))
+
+    assert isinstance(storage, S3Storage)
+
+
+# --- Endpoints when storage fails -----------------------------------------------------------------
+
+
+def upload(client, headers):
+    files = {"file": ("a.png", make_image_bytes(size=(100, 50)), "image/png")}
+    return client.post("/images", headers=headers, files=files)
+
+
+def unavailable(*args, **kwargs):
+    raise StorageUnavailableError("down")
+
+
+@pytest.mark.parametrize(
+    ("operation", "method"),
+    [("upload", "save"), ("download", "open"), ("convert", "read"), ("transform", "read")],
+)
+def test_storage_outage_is_503(client, auth_headers, storage, caplog, operation, method):
+    image = None if operation == "upload" else upload(client, auth_headers).json()
+    setattr(storage, method, unavailable)
+
+    if operation == "upload":
+        response = upload(client, auth_headers)
+    elif operation == "download":
+        response = client.get(image["url"], headers=auth_headers)
+    elif operation == "convert":
+        response = client.get(image["url"], params={"format": "webp"}, headers=auth_headers)
+    else:
+        response = client.post(
+            f"/images/{image['id']}/transform",
+            headers=auth_headers,
+            json={"transformations": {"flip": True}},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Image storage is temporarily unavailable"}
+    assert [r.levelname for r in caplog.records if r.name == "app.main"] == ["WARNING"]
+    if operation == "upload":
+        assert client.get("/images", headers=auth_headers).json()["total"] == 0
+
+
+def test_delete_is_204_even_if_the_file_cannot_be_removed(
+    client, auth_headers, storage, variant_cache, caplog
+):
+    image = upload(client, auth_headers).json()
+    client.get(image["url"], params={"format": "webp"}, headers=auth_headers)
+    key = stored_keys(storage)[0]
+
+    def failing_delete(key):
+        raise OSError("disk unhappy")
+
+    storage.delete = failing_delete
+
+    response = client.delete(f"/images/{image['id']}", headers=auth_headers)
+
+    assert response.status_code == 204
+    assert client.get(f"/images/{image['id']}", headers=auth_headers).status_code == 404
+    assert variant_cache.entries == {}
+    errors = [r for r in caplog.records if r.name == "app.routers.images"]
+    assert [r.levelname for r in errors] == ["ERROR"]
+    assert key in errors[0].getMessage()
+
+
+def test_failed_cleanup_does_not_hide_the_database_error(
+    client, auth_headers, storage, caplog, monkeypatch
+):
+    def failing_commit(self):
+        raise RuntimeError("database went away")
+
+    def failing_delete(key):
+        raise OSError("disk unhappy")
+
+    monkeypatch.setattr(sqlalchemy.orm.Session, "commit", failing_commit)
+    storage.delete = failing_delete
+
+    with pytest.raises(RuntimeError, match="database went away"):
+        upload(client, auth_headers)
+
+    assert [r.levelname for r in caplog.records if r.name == "app.routers.images"] == ["ERROR"]
+
+
+def test_downloads_close_the_stored_file(client, auth_headers, storage):
+    image = upload(client, auth_headers).json()
+    opened = []
+    open_file = storage.open
+
+    def spy(key):
+        file = open_file(key)
+        opened.append(file)
+        return file
+
+    storage.open = spy
+
+    response = client.get(image["url"], headers=auth_headers)
+
+    assert response.status_code == 200
+    assert isinstance(opened[0], FileStream)
+    assert opened[0]._file.closed

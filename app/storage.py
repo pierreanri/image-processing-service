@@ -1,10 +1,57 @@
-import uuid
-from pathlib import Path
-from typing import Annotated
+"""Where image files are kept: on the local disk (the default) or in an S3-compatible bucket.
 
-from fastapi import Depends
+Both backends store a file under the same key (see `build_key`), so moving between them is a
+plain copy. The S3 backend lives in app/storage_s3.py and is only imported when configured.
+"""
+
+import os
+import uuid
+from collections.abc import Iterator
+from functools import lru_cache
+from pathlib import Path
+from typing import BinaryIO, Protocol
 
 from app.config import Settings, get_settings
+
+# Size of the pieces a download is streamed in.
+CHUNK_SIZE = 64 * 1024
+
+
+class StorageUnavailableError(Exception):
+    """The storage service couldn't be reached, timed out or is overloaded (after retries); the
+    same request may succeed later. Answered with 503."""
+
+
+class FileStream:
+    """An open stored file, read in CHUNK_SIZE pieces by iterating over it. Always close() it:
+    that releases the file or the connection (iterating to the end also does)."""
+
+    def __init__(self, file: BinaryIO, size: int) -> None:
+        self.size = size
+        self._file = file
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            while chunk := self._file.read(CHUNK_SIZE):
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        self._file.close()
+
+
+class Storage(Protocol):
+    def save(self, key: str, data: bytes, *, content_type: str) -> None:
+        """Store data under key; readers never see a partially written file."""
+
+    def read(self, key: str) -> bytes: ...
+
+    def open(self, key: str) -> FileStream:
+        """Open a file for streaming. Errors are raised here, before any response starts."""
+
+    def delete(self, key: str) -> None:
+        """Delete a file; a missing key is not an error."""
 
 
 class LocalStorage:
@@ -22,7 +69,7 @@ class LocalStorage:
             raise ValueError(f"Invalid storage key: {key!r}")
         return path
 
-    def save(self, key: str, data: bytes) -> None:
+    def save(self, key: str, data: bytes, *, content_type: str) -> None:
         path = self.path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Write to a temporary file first so readers never see a partially written image.
@@ -36,6 +83,10 @@ class LocalStorage:
     def read(self, key: str) -> bytes:
         return self.path(key).read_bytes()
 
+    def open(self, key: str) -> FileStream:
+        file = self.path(key).open("rb")
+        return FileStream(file, os.fstat(file.fileno()).st_size)
+
     def delete(self, key: str) -> None:
         self.path(key).unlink(missing_ok=True)
 
@@ -44,5 +95,17 @@ def build_key(owner_id: uuid.UUID, extension: str) -> str:
     return f"{owner_id}/{uuid.uuid4().hex}.{extension}"
 
 
-def get_storage(settings: Annotated[Settings, Depends(get_settings)]) -> LocalStorage:
-    return LocalStorage(settings.storage_dir)
+def build_storage(settings: Settings) -> Storage:
+    if settings.storage_backend == "local":
+        return LocalStorage(settings.storage_dir)
+    if not settings.s3_bucket:
+        raise ValueError("S3_BUCKET must be set when STORAGE_BACKEND=s3")
+    # Imported here so that deployments on local disk never load boto3.
+    from app.storage_s3 import S3Storage, create_s3_client
+
+    return S3Storage(create_s3_client(settings), settings.s3_bucket)
+
+
+@lru_cache
+def get_storage() -> Storage:
+    return build_storage(get_settings())

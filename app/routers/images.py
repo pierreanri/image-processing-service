@@ -1,11 +1,14 @@
+import logging
 import math
 import re
 import uuid
+from email.utils import formatdate
 from typing import Annotated
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
+from starlette.types import Receive, Scope, Send
 
 from app.deps import (
     CurrentUser,
@@ -19,7 +22,9 @@ from app.imaging import DEFAULT_QUALITY, FORMATS, apply_transformations, load_im
 from app.models import Image, User
 from app.ratelimit import RateLimitDecision
 from app.schemas import ImageFormat, ImageList, ImageOut, TransformationSpec, TransformRequest
-from app.storage import LocalStorage, build_key
+from app.storage import FileStream, Storage, build_key
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/images", tags=["images"])
 
@@ -116,7 +121,7 @@ def get_image_content(
 ) -> Response:
     """Download an image, optionally converted to another format or quality.
 
-    Conversions are cached in Redis when it is configured.
+    Originals are streamed from storage; conversions are cached in Redis when it is configured.
     """
     image = _get_owned_image(db, user, image_id)
     target_format = format or image.format
@@ -133,8 +138,9 @@ def get_image_content(
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
 
     if variant is None:
-        return FileResponse(
-            storage.path(image.storage_key), media_type=image.mime_type, headers=headers
+        headers["Last-Modified"] = formatdate(image.created_at.timestamp(), usegmt=True)
+        return _StoredFileResponse(
+            storage.open(image.storage_key), media_type=image.mime_type, headers=headers
         )
 
     data = cache.get(image.id, variant)
@@ -222,7 +228,8 @@ def delete_image(
     storage_key = image.storage_key
     db.delete(image)
     db.commit()
-    storage.delete(storage_key)
+    # The image is gone for the API now; failing to remove its file only wastes space.
+    _discard(storage, storage_key)
     # After the commit, so a failed delete never drops a valid cache. Leftovers (Redis down,
     # or a conversion racing the delete) can't be served, because the image lookup 404s first,
     # and they expire with the TTL.
@@ -246,15 +253,41 @@ def _get_owned_image(db: DbSession, user: User, image_id: uuid.UUID) -> Image:
     return image
 
 
-def _persist(db: DbSession, storage: LocalStorage, image: Image, data: bytes) -> None:
-    storage.save(image.storage_key, data)
+def _persist(db: DbSession, storage: Storage, image: Image, data: bytes) -> None:
+    # File first: a crash in between leaves an orphaned file, never a row without its file.
+    storage.save(image.storage_key, data, content_type=image.mime_type)
     db.add(image)
     try:
         db.commit()
     except Exception:
         db.rollback()
-        storage.delete(image.storage_key)
+        _discard(storage, image.storage_key)
         raise
+
+
+def _discard(storage: Storage, key: str) -> None:
+    """Delete a file whose image is gone, logging (not raising) a failure."""
+    try:
+        storage.delete(key)
+    except Exception:
+        logger.exception("Could not delete image file %s; it is left orphaned", key)
+
+
+class _StoredFileResponse(StreamingResponse):
+    """Streams an open stored file with its Content-Length, and always closes it, even when the
+    client disconnects halfway (which releases the file or the S3 connection straight away)."""
+
+    def __init__(self, file: FileStream, *, media_type: str, headers: dict[str, str]) -> None:
+        super().__init__(
+            file, media_type=media_type, headers={**headers, "Content-Length": str(file.size)}
+        )
+        self._file = file
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._file.close()
 
 
 def _to_out(image: Image, request: Request) -> ImageOut:

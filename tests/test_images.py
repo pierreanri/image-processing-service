@@ -1,8 +1,11 @@
 import io
 import logging
 import uuid
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 
 import pytest
+import sqlalchemy.orm
 from PIL import Image
 
 from app.cache import VariantCache, get_variant_cache
@@ -10,7 +13,14 @@ from app.config import get_settings
 from app.main import app
 from app.ratelimit import Limit, RateLimiter, get_transform_rate_limiter
 from app.redis_client import create_redis_client
-from tests.utils import ALLOWED, REJECTED, make_image_bytes, register, user_id_of
+from app.storage import CHUNK_SIZE
+from tests.utils import ALLOWED, REJECTED, make_image_bytes, register, stored_keys, user_id_of
+
+
+@pytest.fixture(params=["local", "s3"])
+def storage(request):
+    """Every test in this module runs against both storage backends (S3 is moto's in-memory S3)."""
+    return request.getfixturevalue(f"{request.param}_storage")
 
 
 def upload(client, headers, data=None, filename="photo.png", content_type="image/png"):
@@ -48,7 +58,9 @@ def test_upload_returns_metadata(client, auth_headers, storage):
     assert body["parent_id"] is None
     assert body["transformations"] is None
     assert body["url"] == f"http://testserver/images/{body['id']}/content"
-    assert len(list(storage.root.rglob("*.png"))) == 1
+    keys = stored_keys(storage)
+    assert len(keys) == 1
+    assert keys[0].endswith(".png")
 
 
 def test_upload_detects_format_from_content_not_filename(client, auth_headers):
@@ -145,8 +157,52 @@ def test_content_returns_original_bytes(client, auth_headers):
     assert response.status_code == 200
     assert response.content == data
     assert response.headers["content-type"] == "image/png"
+    assert response.headers["content-length"] == str(len(data))
+    assert "transfer-encoding" not in response.headers
     assert response.headers["etag"] == f'"{uuid.UUID(image["id"]).hex}"'
     assert "max-age" in response.headers["cache-control"]
+    last_modified = parsedate_to_datetime(response.headers["last-modified"])
+    created_at = datetime.fromisoformat(image["created_at"])
+    assert abs((last_modified - created_at).total_seconds()) < 1
+
+
+def test_content_streams_large_originals_intact(client, auth_headers):
+    # Several storage chunks' worth of incompressible pixels.
+    noise = Image.effect_noise((400, 400), 100).convert("RGB")
+    buffer = io.BytesIO()
+    noise.save(buffer, format="PNG")
+    data = buffer.getvalue()
+    assert len(data) > 3 * CHUNK_SIZE
+    image = uploaded(client, auth_headers, data=data)
+
+    response = client.get(image["url"], headers=auth_headers)
+
+    assert response.content == data
+    assert response.headers["content-length"] == str(len(data))
+
+
+def test_content_ignores_range_requests(client, auth_headers):
+    data = make_image_bytes("PNG")
+    image = uploaded(client, auth_headers, data=data)
+
+    response = client.get(image["url"], headers={**auth_headers, "Range": "bytes=0-9"})
+
+    # Ranges aren't supported: the whole image is sent, as HTTP allows.
+    assert response.status_code == 200
+    assert response.content == data
+    assert "content-range" not in response.headers
+
+
+def test_failed_commit_removes_the_stored_file(client, auth_headers, storage, monkeypatch):
+    def failing_commit(self):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(sqlalchemy.orm.Session, "commit", failing_commit)
+
+    with pytest.raises(RuntimeError, match="database went away"):
+        upload(client, auth_headers)
+
+    assert stored_keys(storage) == []
 
 
 def test_content_supports_conditional_requests(client, auth_headers):
@@ -448,7 +504,7 @@ def test_delete_removes_record_and_file(client, auth_headers, storage):
 
     assert response.status_code == 204
     assert client.get(f"/images/{image['id']}", headers=auth_headers).status_code == 404
-    assert list(storage.root.rglob("*.png")) == []
+    assert stored_keys(storage) == []
 
 
 def test_delete_keeps_derived_images(client, auth_headers):
@@ -511,7 +567,7 @@ def test_rate_limited_transform_is_429_and_creates_nothing(
     assert response.headers["ratelimit-policy"] == REJECTED.headers()["RateLimit-Policy"]
     assert response.headers["ratelimit"] == REJECTED.headers()["RateLimit"]
     assert client.get("/images", headers=auth_headers).json()["total"] == 1
-    assert len([path for path in storage.root.rglob("*") if path.is_file()]) == 1
+    assert len(stored_keys(storage)) == 1
 
 
 @pytest.mark.parametrize(

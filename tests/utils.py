@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.ratelimit import UNCHECKED, Limit, LimitState, RateLimitDecision
+from app.storage import LocalStorage
 
 
 def register(client: TestClient, username: str = "alice", password: str = "password123") -> dict:
@@ -17,6 +18,15 @@ def register(client: TestClient, username: str = "alice", password: str = "passw
 def user_id_of(headers: dict) -> uuid.UUID:
     token = headers["Authorization"].removeprefix("Bearer ")
     return uuid.UUID(jwt.decode(token, options={"verify_signature": False})["sub"])
+
+
+def stored_keys(storage) -> list[str]:
+    """Every key in a LocalStorage or S3Storage (temporary files included), sorted."""
+    if isinstance(storage, LocalStorage):
+        files = (path for path in storage.root.rglob("*") if path.is_file())
+        return sorted(path.relative_to(storage.root).as_posix() for path in files)
+    response = storage.client.list_objects_v2(Bucket=storage.bucket)
+    return sorted(item["Key"] for item in response.get("Contents", []))
 
 
 def make_image_bytes(
