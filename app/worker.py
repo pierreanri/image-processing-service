@@ -1,7 +1,9 @@
 """Runs background transformations: `python -m app.worker`.
 
 One job at a time per process; run more processes (or containers) to go faster. SIGTERM or
-SIGINT stops the worker once its current job is done.
+SIGINT stops the worker once its current job is done. While the database is failing the worker
+backs off and retries; a job it was running when that happened is taken over once its lease runs
+out.
 """
 
 import logging
@@ -41,6 +43,10 @@ class Worker:
             return False
         try:
             run_job(self._sessions, self._storage, self._settings, claim)
+        except SQLAlchemyError:
+            # Likely transient (the database restarting, a deadlock): the job is run again once
+            # its lease runs out, and fails after JOB_MAX_ATTEMPTS claims if it keeps happening.
+            raise
         except Exception:
             logger.exception("Job %s failed unexpectedly", claim.job_id)
             fail(self._sessions, claim, 500, "Internal error while processing the job")
@@ -71,7 +77,8 @@ class Worker:
                 worked = self.run_once()
                 failures = 0
             except SQLAlchemyError as exc:
-                failures += 1
+                # Bounded, so that a long outage can't overflow the delay computation.
+                failures = min(failures + 1, 32)
                 delay = min(
                     self._settings.job_poll_seconds * 2**failures, MAX_ERROR_BACKOFF_SECONDS
                 )
@@ -107,14 +114,24 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     stop = threading.Event()
+    stop_on_signals(stop)
+    Worker(get_sessionmaker(), get_storage(), get_settings()).run(stop)
 
-    def request_stop(signum: int, frame: object) -> None:
+
+def stop_on_signals(stop: threading.Event) -> None:
+    """Set `stop` on SIGTERM or SIGINT."""
+
+    def request_stop() -> None:
         logger.info("Stopping once the current job is done")
         stop.set()
 
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
-    Worker(get_sessionmaker(), get_storage(), get_settings()).run(stop)
+    def handler(signum: int, frame: object) -> None:
+        # Handlers run on the main thread between two bytecodes, possibly while it is inside
+        # stop.wait() holding the lock that stop.set() needs, so set it from another thread.
+        threading.Thread(target=request_stop, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
 
 
 if __name__ == "__main__":

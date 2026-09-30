@@ -4,9 +4,11 @@
 Files are saved before their image row is committed, so a crash or a failed commit in between
 leaves an orphan (as does a failed delete after an image is deleted, or a worker that lost its
 job). Only files older than the grace period are orphans: younger ones may belong to an upload
-or a job that is about to commit. Files whose names the service would never have made are
-ignored, so a bucket or directory shared with other data is safe. Without --delete, nothing is
-deleted.
+or a job that is about to commit. A job's result is committed within its lease
+(JOB_LEASE_SECONDS) or not at all, so the grace period must be longer than the lease. Files whose
+names the service would never have made are ignored, so a bucket or directory shared with other
+data is safe (but not one shared with another deployment of this service, whose files would look
+like orphans). Without --delete, nothing is deleted.
 """
 
 import argparse
@@ -20,6 +22,7 @@ from itertools import islice
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.config import get_settings
 from app.db import get_sessionmaker
 from app.models import Image
 from app.storage import (
@@ -137,6 +140,9 @@ def main(argv: list[str] | None = None) -> int:
         "--delete", action="store_true", help="delete the orphans (default: only list them)"
     )
     args = parser.parse_args(argv)
+    lease = timedelta(seconds=get_settings().job_lease_seconds)
+    if args.grace_hours <= lease:
+        parser.error(f"--grace-hours must be longer than JOB_LEASE_SECONDS ({lease})")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
     sessions, storage = get_sessionmaker(), get_storage()

@@ -1,18 +1,21 @@
+import signal
 import threading
 import time
 import uuid
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import event, func, select, text, update
 from sqlalchemy.exc import OperationalError
 
+import app.jobs
 from app.config import get_settings
 from app.db import get_sessionmaker
-from app.jobs import RETRY_BASE_SECONDS, claim_next, prune_finished, run_job
-from app.main import app
+from app.jobs import RETRY_BASE_SECONDS, _retry_later, claim_next, fail, prune_finished, run_job
+from app.main import app as api
 from app.models import Image, Job
 from app.storage import StorageUnavailableError
+from app.worker import MAX_ERROR_BACKOFF_SECONDS, stop_on_signals
 from tests.utils import ALLOWED, REJECTED, make_image_bytes, register, stored_keys, user_id_of
 
 
@@ -101,8 +104,15 @@ def test_async_transform_is_accepted_as_a_queued_job(client, auth_headers, rate_
         ("respond-async, wait=5", 202),
         ("wait=5, respond-async", 202),
         ("respond-async; foo=bar", 202),
+        ('respond-async; note="a, b"', 202),
+        ('note="a, \\"b\\"", respond-async', 202),
         ("return=minimal", 201),
         ("respond-asynchronously", 201),
+        # Quoted values are opaque, even when they contain commas or semicolons.
+        ('foo="respond-async"', 201),
+        ('foo="a, respond-async, b"', 201),
+        ('wait=5; note="x, respond-async;y"', 201),
+        ('foo="unterminated, respond-async', 201),
     ],
 )
 def test_prefer_header_is_parsed(client, auth_headers, prefer, expected_status):
@@ -243,6 +253,104 @@ def test_deleting_the_source_first_fails_the_job(client, auth_headers, worker):
     assert done["source_image_id"] is None
 
 
+def test_deleting_the_source_while_the_job_runs_fails_it(client, auth_headers, worker, storage):
+    job = queued(client, auth_headers)
+    real_save = storage.save
+
+    def save_then_delete_the_source(key, data, *, content_type):
+        real_save(key, data, content_type=content_type)
+        response = client.delete(f"/images/{job['source_image_id']}", headers=auth_headers)
+        assert response.status_code == 204
+
+    storage.save = save_then_delete_the_source
+
+    worker.run_once()
+
+    done = client.get(job["url"], headers=auth_headers).json()
+    assert done["status"] == "failed"
+    assert done["error"] == {"status_code": 404, "detail": "Image not found"}
+    assert stored_keys(storage) == []  # the result file was discarded
+
+
+def test_deleting_the_source_before_its_file_is_read_fails_the_job(
+    client, auth_headers, worker, storage
+):
+    job = queued(client, auth_headers)
+    real_read = storage.read
+
+    def delete_the_source_then_read(key):
+        response = client.delete(f"/images/{job['source_image_id']}", headers=auth_headers)
+        assert response.status_code == 204
+        return real_read(key)
+
+    storage.read = delete_the_source_then_read
+
+    worker.run_once()
+
+    done = client.get(job["url"], headers=auth_headers).json()
+    assert done["status"] == "failed"
+    assert done["error"] == {"status_code": 404, "detail": "Image not found"}
+
+
+def test_deleting_the_source_while_its_job_completes_does_not_deadlock(
+    client, auth_headers, worker, storage
+):
+    """Completing a job and deleting its source lock the same two rows (the job and the source
+    image); they must do so in the same order. The source is deleted right after the worker's
+    first statement in the completing transaction, while that transaction is still open."""
+    job = queued(client, auth_headers)
+    engine = get_sessionmaker().kw["bind"]
+    worker_thread = threading.get_ident()
+    completing = threading.Event()
+    outcome = {}
+
+    def delete_source():
+        response = client.delete(f"/images/{job['source_image_id']}", headers=auth_headers)
+        outcome["delete"] = response.status_code
+
+    deleter = threading.Thread(target=delete_source)
+    real_complete = app.jobs._complete
+
+    def complete(*args):
+        completing.set()
+        return real_complete(*args)
+
+    def after_statement(conn, cursor, statement, parameters, context, executemany):
+        if threading.get_ident() != worker_thread or not completing.is_set():
+            return
+        completing.clear()
+        deleter.start()
+        # Until the delete waits for a lock this transaction holds (or has finished).
+        deadline = time.monotonic() + 5
+        while deleter.is_alive() and time.monotonic() < deadline:
+            with engine.connect() as probe:
+                waiting = probe.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity"
+                        " WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                    )
+                )
+            if waiting:
+                break
+            time.sleep(0.01)
+
+    app.jobs._complete = complete
+    event.listen(engine, "after_cursor_execute", after_statement)
+    try:
+        worker.run_once()
+    finally:
+        event.remove(engine, "after_cursor_execute", after_statement)
+        app.jobs._complete = real_complete
+        if deleter.ident:
+            deleter.join(10)
+
+    assert outcome == {"delete": 204}
+    done = client.get(job["url"], headers=auth_headers).json()
+    assert done["status"] == "succeeded"
+    assert done["source_image_id"] is None
+    assert done["result"]["parent_id"] is None
+
+
 def test_storage_outages_are_retried_with_backoff_then_fail(client, auth_headers, worker, storage):
     job = queued(client, auth_headers)
 
@@ -272,6 +380,42 @@ def test_storage_outages_are_retried_with_backoff_then_fail(client, auth_headers
     }
 
 
+def test_database_errors_during_a_job_leave_it_to_be_retried(
+    client, auth_headers, worker, monkeypatch
+):
+    job = queued(client, auth_headers)
+
+    def database_went_away(*args):
+        raise OperationalError("INSERT", {}, Exception("database went away"))
+
+    monkeypatch.setattr(app.jobs, "_complete", database_went_away)
+
+    with pytest.raises(OperationalError):  # for the worker loop to back off
+        worker.run_once()
+
+    # Not failed: it runs again once its lease is over.
+    assert db_job(job["id"]).status == "running"
+
+
+def test_a_job_that_succeeds_after_a_retry_has_no_error(client, auth_headers, worker, storage):
+    job = queued(client, auth_headers)
+    real_read = storage.read
+
+    def unavailable(key):
+        raise StorageUnavailableError("down")
+
+    storage.read = unavailable
+    worker.run_once()
+    assert client.get(job["url"], headers=auth_headers).json()["error"]["status_code"] == 503
+    storage.read = real_read
+    update_job(job["id"], available_at=func.now())
+
+    worker.run_once()
+
+    done = client.get(job["url"], headers=auth_headers).json()
+    assert (done["status"], done["attempts"], done["error"]) == ("succeeded", 2, None)
+
+
 def test_unexpected_errors_fail_the_job(client, auth_headers, worker, storage):
     job = queued(client, auth_headers)
 
@@ -291,6 +435,19 @@ def test_unexpected_errors_fail_the_job(client, auth_headers, worker, storage):
 
 
 # --- Claims and leases ----------------------------------------------------------------------------
+
+
+def test_a_claim_leases_the_job(client, auth_headers):
+    job = queued(client, auth_headers)
+
+    with get_sessionmaker()() as db:
+        claim = claim_next(db, 300)
+
+    claimed = db_job(job["id"])
+    assert (claimed.status, claimed.attempts, claimed.claim_token) == ("running", 1, claim.token)
+    assert 298 < seconds_until(claimed.available_at) <= 300
+    with get_sessionmaker()() as db:
+        assert claim_next(db, 300) is None  # leased
 
 
 def test_claims_skip_jobs_locked_by_another_worker(client, auth_headers):
@@ -334,6 +491,42 @@ def test_an_expired_lease_is_taken_over_and_the_stale_run_cannot_finish(
     with sessions() as db:
         assert db.scalar(select(func.count()).select_from(Image)) == 2
     assert len(stored_keys(storage)) == 2
+
+
+def test_a_stale_run_cannot_fail_or_requeue_a_job_taken_over(client, auth_headers, storage):
+    job = queued(client, auth_headers)
+    sessions, settings = get_sessionmaker(), get_settings()
+    with sessions() as db:
+        stale = claim_next(db, 300)
+    update_job(job["id"], available_at=func.now() - timedelta(seconds=1))
+    with sessions() as db:
+        current = claim_next(db, 300)
+
+    fail(sessions, stale, 500, "stale")
+    _retry_later(sessions, settings, stale, StorageUnavailableError("down"))
+
+    after = db_job(job["id"])
+    assert (after.status, after.claim_token, after.error_status) == ("running", current.token, None)
+    assert seconds_until(after.available_at) > 290
+
+
+def test_a_run_whose_lease_ran_out_cannot_finish(client, auth_headers, storage):
+    """Even if no other worker has taken the job over yet: its result would be committed after
+    the lease, which the orphan sweep's grace period doesn't allow for."""
+    job = queued(client, auth_headers)
+    sessions, settings = get_sessionmaker(), get_settings()
+    with sessions() as db:
+        late = claim_next(db, 300)
+    update_job(job["id"], available_at=func.now() - timedelta(seconds=1))
+
+    run_job(sessions, storage, settings, late)
+    fail(sessions, late, 500, "late")
+
+    after = db_job(job["id"])
+    assert (after.status, after.claim_token, after.error_status) == ("running", late.token, None)
+    assert len(stored_keys(storage)) == 1  # its result file was discarded
+    with sessions() as db:
+        assert claim_next(db, 300).attempts == 2  # the job is run again
 
 
 def test_jobs_interrupted_too_often_are_failed(client, auth_headers, worker):
@@ -403,8 +596,92 @@ def test_worker_loop_survives_database_errors(worker, monkeypatch):
     assert len(calls) == 2
 
 
+class RecordingStop:
+    """Stands in for the worker's stop event: records how long each wait() was asked to last,
+    returns at once, and is set after `waits` of them (or, so that a loop that stopped waiting
+    fails instead of spinning forever, after many more checks)."""
+
+    def __init__(self, waits: int) -> None:
+        self.waits: list[float] = []
+        self._limit = waits
+        self._checks = 0
+
+    def is_set(self) -> bool:
+        self._checks += 1
+        return len(self.waits) >= self._limit or self._checks > 10 * self._limit
+
+    def wait(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        return self.is_set()
+
+
+def test_worker_loop_prunes_first_and_waits_between_polls_when_idle(worker, monkeypatch):
+    pruned = []
+    monkeypatch.setattr(worker, "prune", lambda: pruned.append(1))
+    monkeypatch.setattr(worker, "run_once", lambda: False)
+    stop = RecordingStop(waits=3)
+
+    worker.run(stop)
+
+    assert pruned == [1]  # at startup; the next one is due in an hour
+    assert stop.waits == [worker._settings.job_poll_seconds] * 3
+
+
+def test_worker_loop_backs_off_on_database_errors_and_resets(worker, monkeypatch):
+    monkeypatch.setattr(worker, "prune", lambda: None)
+    outcomes = iter([OperationalError, OperationalError, False, OperationalError])
+
+    def run_once():
+        outcome = next(outcomes, OperationalError)
+        if outcome is OperationalError:
+            raise OperationalError("SELECT 1", {}, Exception("database went away"))
+        return outcome
+
+    monkeypatch.setattr(worker, "run_once", run_once)
+    stop = RecordingStop(waits=7)
+
+    worker.run(stop)
+
+    poll = worker._settings.job_poll_seconds
+    assert stop.waits == [2 * poll, 4 * poll, poll, 2 * poll, 4 * poll, 8 * poll, 16 * poll]
+
+
+def test_worker_loop_backoff_stays_capped_through_a_long_outage(worker, monkeypatch):
+    def run_once():
+        raise OperationalError("SELECT 1", {}, Exception("database went away"))
+
+    monkeypatch.setattr(worker, "prune", lambda: None)
+    monkeypatch.setattr(worker, "run_once", run_once)
+    stop = RecordingStop(waits=3000)
+
+    worker.run(stop)
+
+    assert stop.waits[-1] == MAX_ERROR_BACKOFF_SECONDS
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_signals_set_the_stop_event_from_another_thread(monkeypatch, signum):
+    """A handler runs on the main thread, possibly while stop.wait() there holds the lock that
+    stop.set() takes: setting it from the handler itself could deadlock."""
+    handlers = {}
+    monkeypatch.setattr(signal, "signal", handlers.__setitem__)
+
+    class RecordingEvent(threading.Event):
+        def set(self) -> None:
+            self.setter = threading.get_ident()
+            super().set()
+
+    stop = RecordingEvent()
+    stop_on_signals(stop)
+
+    handlers[signum](signum, None)
+
+    assert stop.wait(5)
+    assert stop.setter != threading.get_ident()
+
+
 def test_openapi_documents_async_transforms_and_jobs():
-    paths = app.openapi()["paths"]
+    paths = api.openapi()["paths"]
     accepted = paths["/images/{image_id}/transform"]["post"]["responses"]["202"]
 
     assert accepted["content"]["application/json"]["schema"]["$ref"].endswith("/JobOut")

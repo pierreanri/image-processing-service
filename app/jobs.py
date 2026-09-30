@@ -3,10 +3,11 @@
 A job goes queued -> running -> succeeded or failed. Workers claim jobs with
 FOR UPDATE SKIP LOCKED, so any number of them can share the table. A claim is a lease: a job
 whose worker died is taken over once `available_at` (the lease deadline) passes. Each claim
-carries a fresh token, and every change a worker makes to a job requires that token, so a
-worker whose lease expired can neither finish nor fail a job another worker has taken over.
-Processing happens outside any transaction: the result file is saved first, then one
-transaction inserts the result image and marks the job succeeded.
+carries a fresh token, and every change a worker makes to a job requires that token and an
+unexpired lease, so a worker whose lease ran out can neither finish nor fail the job (whether or
+not another worker has taken it over yet). Processing happens outside any transaction: the
+result file is saved first, then one transaction inserts the result image and marks the job
+succeeded, well within the orphan sweep's grace period (see app/sweep_orphans.py).
 """
 
 import logging
@@ -115,6 +116,12 @@ def run_job(
     except StorageUnavailableError as exc:
         _retry_later(sessions, settings, claim, exc)
         return
+    except Exception:
+        # Reading the source's file fails if the image was deleted since its row was read.
+        if _image_exists(sessions, source.id):
+            raise
+        fail(sessions, claim, 404, SOURCE_GONE)
+        return
 
     if not _complete(sessions, claim, image):
         discard_file(storage, image.storage_key)
@@ -123,10 +130,9 @@ def run_job(
 def _complete(sessions: sessionmaker[Session], claim: Claim, image: Image) -> bool:
     """Insert the result image and mark the job succeeded, if this claim still holds it."""
     with sessions() as db:
-        job = db.scalar(_claimed(claim).with_for_update())
-        if job is None:
-            logger.info("Job %s was taken over or deleted; discarding its result", claim.job_id)
-            return False
+        # The image first: its foreign keys lock the source image (and owner) before the job
+        # row, in the same order as deleting the source does (it then clears
+        # jobs.source_image_id), so the two can't deadlock.
         db.add(image)
         try:
             db.flush()
@@ -135,11 +141,23 @@ def _complete(sessions: sessionmaker[Session], claim: Claim, image: Image) -> bo
             db.rollback()
             fail(sessions, claim, 404, SOURCE_GONE)
             return False
-        job.status = "succeeded"
-        job.result_image_id = image.id
-        job.finished_at = func.now()
-        job.claim_token = None
-        job.error_status = job.error_detail = None
+        updated = db.execute(
+            _update_claimed(claim).values(
+                status="succeeded",
+                result_image_id=image.id,
+                finished_at=func.now(),
+                claim_token=None,
+                error_status=None,
+                error_detail=None,
+            )
+        ).rowcount
+        if not updated:
+            db.rollback()
+            logger.info(
+                "Job %s was taken over, deleted, or its lease ran out; discarding its result",
+                claim.job_id,
+            )
+            return False
         db.commit()
     logger.info("Job %s succeeded: image %s", claim.job_id, image.id)
     return True
@@ -197,15 +215,21 @@ def prune_finished(db: Session, retention_days: int) -> int:
     return deleted
 
 
-def _claimed(claim: Claim):
-    return select(Job).where(
-        Job.id == claim.job_id, Job.claim_token == claim.token, Job.status == "running"
-    )
+def _image_exists(sessions: sessionmaker[Session], image_id: uuid.UUID) -> bool:
+    with sessions() as db:
+        return db.scalar(select(Image.id).where(Image.id == image_id)) is not None
 
 
 def _update_claimed(claim: Claim):
+    """An UPDATE of the job that only applies while this claim holds it: the token is still this
+    claim's and the lease hasn't run out."""
     return (
         update(Job)
-        .where(Job.id == claim.job_id, Job.claim_token == claim.token, Job.status == "running")
+        .where(
+            Job.id == claim.job_id,
+            Job.claim_token == claim.token,
+            Job.status == "running",
+            Job.available_at > func.now(),
+        )
         .execution_options(synchronize_session=False)
     )

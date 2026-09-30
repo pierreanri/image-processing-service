@@ -12,6 +12,7 @@ x-app-environment: &app-environment
   S3_BUCKET: imgsvc
   S3_ACCESS_KEY_ID: imgsvc
   S3_SECRET_ACCESS_KEY: imgsvc-dev-secret
+  JOB_POLL_SECONDS: ${JOB_POLL_SECONDS:-1.0}
   JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
   JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
   JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-7}
@@ -115,6 +116,7 @@ services:
     environment: *app-environment
     volumes:
       - images:/data/storage
+    restart: unless-stopped
     # On `docker compose stop` the worker finishes its current job first.
     stop_grace_period: 60s
 

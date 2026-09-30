@@ -93,7 +93,7 @@ Settings come from environment variables or a `.env` file.
 | `TRANSFORM_RATE_LIMIT_PER_MINUTE` | `30` | Transformations each user may start per minute; `0` turns this limit off |
 | `TRANSFORM_RATE_LIMIT_PER_HOUR` | `500` | Transformations each user may start per hour; `0` turns this limit off |
 | `JOB_POLL_SECONDS` | `1.0` | How often an idle worker checks for background jobs |
-| `JOB_LEASE_SECONDS` | `300` | How long a job may run before another worker may take it over |
+| `JOB_LEASE_SECONDS` | `300` | How long a worker may take over a job; a longer run's result is discarded and the job is run again (keep it well above the slowest transformation, and below the sweep's `--grace-hours`) |
 | `JOB_MAX_ATTEMPTS` | `3` | Runs of a job (retries after storage outages, takeovers) before it fails |
 | `JOB_RETENTION_DAYS` | `7` | Finished jobs are deleted after this many days |
 
@@ -120,7 +120,8 @@ is a plain copy, for example with the AWS CLI (add `--endpoint-url` for R2 or Se
 works too):
 
 1. With the API still running on local disk: `aws s3 sync ./storage s3://<bucket> --exclude "*.tmp"`.
-2. Stop the API and run the same `sync` again to pick up the last uploads.
+2. Stop the API and every worker (they write result files too), then run the same `sync` again to
+   pick up the last files. Jobs still queued are run by the workers once they restart on S3.
 3. Set `STORAGE_BACKEND=s3` and the `S3_*` settings, then start the API.
 4. Check a few downloads before removing the local files. Moving back is the reverse `sync`.
 
@@ -136,7 +137,7 @@ SeaweedFS (bucket `imgsvc`; `S3_*` values in `.env` are ignored), so:
      aws s3 sync ./storage-export s3://imgsvc --endpoint-url http://localhost:8333 --exclude "*.tmp"
    ```
 
-2. `docker compose stop api`, then repeat both commands to pick up the last uploads.
+2. `docker compose stop api worker`, then repeat both commands to pick up the last files.
 3. Set `STORAGE_BACKEND=s3` and `COMPOSE_PROFILES=s3` in `.env`, then `docker compose up -d`.
 4. Check a few downloads; the `images` volume keeps the old files until you remove it.
 
@@ -163,10 +164,12 @@ python -m app.sweep_orphans --grace-hours 72 --delete
 docker compose exec api python -m app.sweep_orphans --delete
 ```
 
-Only files older than `--grace-hours` (default 24, at least 1) are considered, since a younger file
-may belong to an upload or a job that is about to commit. Files whose names the service would never
-have made (anything but `{user id}/{random}.{ext}` and its temporary files) are ignored and counted
-in the summary, so a directory or bucket shared with other data is safe. It exits with `1` if a
+Only files older than `--grace-hours` (default 24, at least 1, and longer than `JOB_LEASE_SECONDS`)
+are considered, since a younger file may belong to an upload or a job that is about to commit.
+Files whose names the service would never have made (anything but `{user id}/{random}.{ext}` and
+its temporary files) are ignored and counted in the summary, so a directory or bucket shared with
+other data is safe. Never share one with another deployment of this service that has its own
+database: its files look like this one's, and would be deleted as orphans. It exits with `1` if a
 deletion failed. It can run at any time, for example daily from cron:
 `17 4 * * * cd /srv/imgsvc && docker compose exec -T api python -m app.sweep_orphans --delete`.
 
@@ -188,9 +191,9 @@ real server checks request signatures and `Content-MD5`, which `tests/test_stora
 covers against `TEST_S3_ENDPOINT_URL` (default `http://localhost:8333`, the compose SeaweedFS) and
 bucket `TEST_S3_BUCKET` (default `imgsvc-test`, which compose creates), with compose's development
 keys by default (`TEST_S3_ACCESS_KEY_ID`, `TEST_S3_SECRET_ACCESS_KEY`). It is skipped when the
-server is unreachable, or fails with `REQUIRE_S3_TESTS=1`; it only lists, writes and deletes
-objects under its own random prefixes (so it needs `s3:ListBucket`) and never empties or deletes the
-bucket. Run it before changing `app/storage_s3.py`.
+server is unreachable, or fails with `REQUIRE_S3_TESTS=1`; it lists the bucket (so it needs
+`s3:ListBucket`), only writes and deletes objects under its own random prefixes, and never empties
+or deletes the bucket. Run it before changing `app/storage_s3.py`.
 
 ```bash
 createdb imgsvc_test          # or: docker compose up db, then create it with psql
@@ -461,20 +464,24 @@ enforced (Redis configured and reachable).
   and mark the job succeeded in one transaction.
 - **Job leases**: a claim is a lease of `JOB_LEASE_SECONDS`; the job's `available_at` holds its
   deadline. If a worker dies, another one takes the job over once the lease has run out. Each
-  claim carries a fresh token and every change a worker makes to a job requires it, so a worker
-  that was merely slow can't finish (or fail) a job that was taken over: it deletes its result file
-  instead, and each job produces at most one image. A job claimed more than `JOB_MAX_ATTEMPTS` times
+  claim carries a fresh token, and every change a worker makes to a job requires that token and
+  an unexpired lease, so a worker that was merely slow can't finish (or fail) the job once its
+  lease has run out: it deletes its result file instead, and each job produces at most one image.
+  This also bounds how long after storing its file a job can commit the image, which the orphan
+  sweep relies on. A job claimed more than `JOB_MAX_ATTEMPTS` times
   (its workers keep dying) fails with `500`, so a job that crashes its worker can't loop forever. Keep the lease well above the
   slowest transformation.
 - **Job failures**: a transformation that doesn't fit the image fails at once, with the same status
   and detail as the synchronous request. A storage outage puts the job back in the queue after
   10 s, then 20 s, 40 s, … until `JOB_MAX_ATTEMPTS` runs, then fails it with `503`. Anything
   unexpected is logged and fails the job with `500`. Database errors make the worker back off (up
-  to 30 s) and retry.
+  to 30 s) and retry; a job it was running then is run again once its lease has run out.
+- **Lock order**: completing a job inserts the result image (whose foreign key locks the source
+  image) before updating the job row, the same order in which deleting the source image locks
+  the image and then clears the job's `source_image_id`, so the two can't deadlock.
 - **Orphan sweep** (`app/sweep_orphans.py`): lists the storage (`list_files`) and checks the keys
   against `images.storage_key` 1000 at a time. The grace period covers the gap between storing a
-  file and committing its row, which is at most a few seconds in practice; the one-hour minimum
-  leaves ample margin.
+  file and committing its row: a few seconds in practice, and for a job at most its lease.
 
 ### Possible next steps
 

@@ -5,9 +5,9 @@ Uses TEST_S3_ENDPOINT_URL (default http://localhost:8333, the SeaweedFS started 
 creates) and TEST_S3_ACCESS_KEY_ID / TEST_S3_SECRET_ACCESS_KEY (default: compose's development
 keys). With REQUIRE_S3_TESTS=1 an unreachable server fails the tests instead of skipping them.
 
-Only a real server checks signatures and Content-MD5 (moto does neither). The tests only list,
-write and delete objects under their own random key prefixes (so they need s3:ListBucket); they
-never empty or delete the bucket.
+Only a real server checks signatures and Content-MD5 (moto does neither). The tests list the bucket
+(so they need s3:ListBucket), only write and delete objects under their own random key prefixes,
+and never empty or delete the bucket.
 """
 
 import os

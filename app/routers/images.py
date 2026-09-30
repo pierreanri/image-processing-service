@@ -261,11 +261,16 @@ def _prefers_async(prefer_headers: list[str]) -> bool:
     """Whether the Prefer headers (RFC 7240) include `respond-async`; its parameters, and other
     preferences such as `wait`, are ignored."""
     for header in prefer_headers:
-        for preference in header.split(","):
+        # Values may be quoted strings, which can contain commas and semicolons.
+        for preference in _QUOTED_STRING.sub('""', header).split(","):
             name = preference.split(";", 1)[0].split("=", 1)[0].strip().lower()
             if name == "respond-async":
                 return True
     return False
+
+
+# An unterminated quote runs to the end of the header.
+_QUOTED_STRING = re.compile(r'"(?:[^"\\]|\\.)*(?:"|$)')
 
 
 def _too_many_transformations(decision: RateLimitDecision) -> HTTPException:

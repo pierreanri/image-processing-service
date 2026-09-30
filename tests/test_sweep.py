@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import app.sweep_orphans
+from app.config import get_settings
 from app.db import get_sessionmaker
 from app.models import Image
 from app.storage import StorageUnavailableError, build_key
@@ -252,6 +253,19 @@ def test_command_reports_ignored_files(cli, storage, capsys):
     out = capsys.readouterr().out
     assert "Found 0 orphaned files (0 bytes) among 1 file; ignored 1 file the service" in out
     assert "Dry run" not in out
+
+
+@local_only
+def test_command_needs_a_grace_period_longer_than_the_job_lease(cli, monkeypatch, capsys):
+    settings = get_settings().model_copy(update={"job_lease_seconds": 2 * 3600})
+    monkeypatch.setattr(app.sweep_orphans, "get_settings", lambda: settings)
+
+    with pytest.raises(SystemExit) as raised:
+        cli("--grace-hours", "2")
+
+    assert raised.value.code == 2
+    assert "longer than JOB_LEASE_SECONDS" in capsys.readouterr().err
+    assert cli("--grace-hours", "2.5") == 0
 
 
 @local_only

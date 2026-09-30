@@ -50,7 +50,8 @@ class Settings(BaseSettings):
     # Background transformations (POST /images/{id}/transform with Prefer: respond-async).
     # How often an idle worker looks for jobs.
     job_poll_seconds: float = Field(default=1.0, gt=0)
-    # How long a worker may hold a job before another worker may take it over.
+    # How long a worker may take over a job; after that its result is discarded and another
+    # worker may take the job over.
     job_lease_seconds: int = Field(default=300, gt=0)
     # Runs of a job (including retries after storage outages) before it is failed.
     job_max_attempts: int = Field(default=3, ge=1)
