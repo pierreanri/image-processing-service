@@ -1,15 +1,24 @@
+import asyncio
 import base64
 import hashlib
+import io
 import os
+import threading
 import uuid
 from unittest.mock import MagicMock
 
 import botocore.exceptions
 import pytest
 import sqlalchemy.orm
+import urllib3.exceptions
 from pydantic import ValidationError
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
-from app.config import Settings
+from app.config import Settings, get_settings
+from app.db import get_db
+from app.main import app
+from app.routers.images import _StoredFileResponse
 from app.storage import (
     CHUNK_SIZE,
     FileStream,
@@ -177,6 +186,9 @@ def call(storage: S3Storage, operation: str):
         client_error("InternalError", 500),
         client_error("TooManyRequests", 429),
         client_error("RequestTimeout", 400),
+        urllib3.exceptions.ProtocolError("Connection broken", ConnectionResetError()),
+        urllib3.exceptions.ReadTimeoutError(None, None, "Read timed out."),
+        urllib3.exceptions.SSLError("bad record mac"),
     ],
     ids=lambda error: (
         type(error).__name__
@@ -254,6 +266,10 @@ def test_unknown_backends_are_rejected():
     ("overrides", "error"),
     [
         ({"s3_endpoint_url": "s3:8333"}, ValueError),
+        ({"s3_endpoint_url": "s3://imgsvc"}, ValueError),
+        ({"s3_endpoint_url": "htps://localhost:8333"}, ValueError),
+        ({"s3_endpoint_url": "http://localhost:83330"}, ValueError),
+        ({"s3_endpoint_url": "http://localhost:abc"}, ValueError),
         ({"s3_secret_access_key": ""}, botocore.exceptions.PartialCredentialsError),
     ],
 )
@@ -334,8 +350,13 @@ def test_delete_is_204_even_if_the_file_cannot_be_removed(
 def test_failed_cleanup_does_not_hide_the_database_error(
     client, auth_headers, storage, caplog, monkeypatch
 ):
+    commit = sqlalchemy.orm.Session.commit
+
     def failing_commit(self):
-        raise RuntimeError("database went away")
+        # Only the commit that inserts the image fails (not the read-only ones before it).
+        if self.new:
+            raise RuntimeError("database went away")
+        commit(self)
 
     def failing_delete(key):
         raise OSError("disk unhappy")
@@ -366,3 +387,113 @@ def test_downloads_close_the_stored_file(client, auth_headers, storage):
     assert response.status_code == 200
     assert isinstance(opened[0], FileStream)
     assert opened[0]._file.closed
+
+
+@pytest.fixture
+def empty_credential_chain(monkeypatch, tmp_path):
+    """boto3's default credential chain finds nothing (instance metadata is already disabled)."""
+    for name in list(os.environ):
+        if name.startswith(("AWS_ACCESS", "AWS_SECRET", "AWS_SESSION", "AWS_PROFILE")) or name in (
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing-config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "missing-credentials"))
+
+
+def test_missing_credentials_stop_startup(empty_credential_chain):
+    # Otherwise the client would keep no credentials for good and every request would be a 500.
+    with pytest.raises(RuntimeError, match="No S3 credentials"):
+        build_storage(s3_settings(s3_access_key_id="", s3_secret_access_key=""))
+
+
+def test_default_credential_chain_is_used_without_keys(empty_credential_chain, monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "from-the-environment")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+    storage = build_storage(s3_settings(s3_access_key_id="", s3_secret_access_key=""))
+
+    credentials = storage.client._request_signer._credentials
+    assert credentials.access_key == "from-the-environment"
+
+
+def test_downloads_are_closed_when_the_client_disconnects():
+    closed = []
+
+    class Body(io.BytesIO):
+        def close(self):
+            closed.append(True)
+            super().close()
+
+    size = 8 * CHUNK_SIZE
+    response = _StoredFileResponse(
+        FileStream(Body(os.urandom(size)), size), media_type="image/png", headers={}
+    )
+    body_messages = []
+
+    async def run() -> None:
+        disconnected = asyncio.Event()
+
+        async def receive():
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                body_messages.append(message)
+                disconnected.set()
+                await asyncio.sleep(0.05)
+
+        scope = {"type": "http", "asgi": {"spec_version": "2.3"}, "method": "GET", "headers": []}
+        await response(scope, receive, send)
+        # Checked while the response (and its half-read iterator) is still alive.
+        assert closed
+
+    asyncio.run(run())
+    assert len(body_messages) < 8
+
+
+def test_storage_calls_do_not_hold_a_database_connection(client, auth_headers, storage):
+    """While storage is slow, other requests must still get a database connection: the pool is
+    smaller than the threadpool."""
+    image = upload(client, auth_headers).json()
+    engine = create_engine(
+        get_settings().database_url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=2,
+    )
+    tiny_pool = sessionmaker(bind=engine, expire_on_commit=False)
+
+    def get_db_from_tiny_pool():
+        with tiny_pool() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = get_db_from_tiny_pool
+    storage_called, release_storage = threading.Event(), threading.Event()
+    open_file = storage.open
+
+    def slow_open(key):
+        storage_called.set()
+        release_storage.wait(10)
+        return open_file(key)
+
+    storage.open = slow_open
+    download = {}
+    thread = threading.Thread(
+        target=lambda: download.update(response=client.get(image["url"], headers=auth_headers))
+    )
+    try:
+        thread.start()
+        assert storage_called.wait(10)
+
+        metadata = client.get(f"/images/{image['id']}", headers=auth_headers)
+
+        assert metadata.status_code == 200
+    finally:
+        release_storage.set()
+        thread.join(10)
+        engine.dispose()
+    assert download["response"].status_code == 200

@@ -136,6 +136,7 @@ def get_image_content(
     headers = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
     if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    _release_connection(db)
 
     if variant is None:
         headers["Last-Modified"] = formatdate(image.created_at.timestamp(), usegmt=True)
@@ -188,6 +189,7 @@ def transform_image(
     over a limit the response is 429 with `Retry-After`.
     """
     source = _get_owned_image(db, user, image_id)
+    _release_connection(db)
     # Counted only once the request is authenticated, schema-valid and about the user's own
     # image (so 401, request-validation 422 and 404 never use quota); a transformation that
     # fails after this (400/415/422) still counts.
@@ -253,7 +255,17 @@ def _get_owned_image(db: DbSession, user: User, image_id: uuid.UUID) -> Image:
     return image
 
 
+def _release_connection(db: DbSession) -> None:
+    """End the request's read-only transaction so its pooled connection isn't held while
+    storage (possibly S3, over the network) is slow: the DB pool is smaller than the
+    threadpool, and running out would break endpoints that never touch storage. Loaded
+    objects stay usable (expire_on_commit=False) and a later query checks out a connection
+    again."""
+    db.commit()
+
+
 def _persist(db: DbSession, storage: Storage, image: Image, data: bytes) -> None:
+    _release_connection(db)
     # File first: a crash in between leaves an orphaned file, never a row without its file.
     storage.save(image.storage_key, data, content_type=image.mime_type)
     db.add(image)

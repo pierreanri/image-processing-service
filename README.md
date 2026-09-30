@@ -92,12 +92,15 @@ Options in the query string of `REDIS_URL` override the client settings; don't s
 or an unknown or invalid option in `REDIS_URL` also stops startup, but an unreachable Redis does
 not.
 
-For S3, a missing `S3_BUCKET`, an invalid `S3_ENDPOINT_URL` or only one of the two keys stops
-startup. No request is sent to S3 at startup, so a wrong bucket name or credentials show up on the
-first upload or download (as a `500`, with the S3 error in the logs). `AWS_*` variables are only
-read from the real environment, never from `.env`, so put keys in `S3_ACCESS_KEY_ID` /
-`S3_SECRET_ACCESS_KEY` there. On AWS, the API needs `s3:GetObject`, `s3:PutObject` and
-`s3:DeleteObject` on `arn:aws:s3:::<bucket>/*`.
+For S3, a missing `S3_BUCKET`, an invalid `S3_ENDPOINT_URL` (it must be `http(s)://host[:port]`),
+only one of the two keys, or no keys and nothing found by boto3's default credential chain stops
+startup. Without keys, the credentials are looked up at startup (an instance role means asking the
+instance metadata service), so a failed lookup makes the API exit and be restarted rather than run
+without credentials. No request is sent to S3 itself at startup, so a wrong bucket name or wrong
+keys show up on the first upload or download (as a `500`, with the S3 error in the logs).
+`AWS_*` variables are only read from the real environment, never from `.env`, so put keys in
+`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` there. On AWS, the API needs `s3:GetObject`,
+`s3:PutObject` and `s3:DeleteObject` on `arn:aws:s3:::<bucket>/*`.
 
 #### Switching an existing deployment to S3
 
@@ -106,10 +109,25 @@ is a plain copy, for example with the AWS CLI (add `--endpoint-url` for R2 or Se
 works too):
 
 1. With the API still running on local disk: `aws s3 sync ./storage s3://<bucket> --exclude "*.tmp"`.
-   With compose, first copy the files out of the volume: `docker compose cp api:/data/storage ./storage`.
 2. Stop the API and run the same `sync` again to pick up the last uploads.
 3. Set `STORAGE_BACKEND=s3` and the `S3_*` settings, then start the API.
 4. Check a few downloads before removing the local files. Moving back is the reverse `sync`.
+
+With docker compose the files are in the `images` volume and the API always uses the bundled
+SeaweedFS (bucket `imgsvc`; `S3_*` values in `.env` are ignored), so:
+
+1. Start SeaweedFS (`docker compose --profile s3 up -d s3`), then copy the files out of the volume
+   into a fresh directory and sync them; the trailing `/.` stops a repeated copy from nesting:
+
+   ```bash
+   rm -rf ./storage-export && docker compose cp api:/data/storage/. ./storage-export
+   AWS_ACCESS_KEY_ID=imgsvc AWS_SECRET_ACCESS_KEY=imgsvc-dev-secret \
+     aws s3 sync ./storage-export s3://imgsvc --endpoint-url http://localhost:8333 --exclude "*.tmp"
+   ```
+
+2. `docker compose stop api`, then repeat both commands to pick up the last uploads.
+3. Set `STORAGE_BACKEND=s3` and `COMPOSE_PROFILES=s3` in `.env`, then `docker compose up -d`.
+4. Check a few downloads; the `images` volume keeps the old files until you remove it.
 
 ### Tests and linting
 
@@ -129,8 +147,9 @@ real server checks request signatures and `Content-MD5`, which `tests/test_stora
 covers against `TEST_S3_ENDPOINT_URL` (default `http://localhost:8333`, the compose SeaweedFS) and
 bucket `TEST_S3_BUCKET` (default `imgsvc-test`, which compose creates), with compose's development
 keys by default (`TEST_S3_ACCESS_KEY_ID`, `TEST_S3_SECRET_ACCESS_KEY`). It is skipped when the
-server is unreachable, or fails with `REQUIRE_S3_TESTS=1`; it only touches objects under random
-prefixes and never lists or empties the bucket. Run it before changing `app/storage_s3.py`.
+server is unreachable, or fails with `REQUIRE_S3_TESTS=1`; it only lists, writes and deletes
+objects under its own random prefixes (so it needs `s3:ListBucket`) and never empties or deletes the
+bucket. Run it before changing `app/storage_s3.py`.
 
 ```bash
 createdb imgsvc_test          # or: docker compose up db, then create it with psql
@@ -291,6 +310,8 @@ enforced (Redis configured and reachable).
   fails, the file is deleted), and a deleted image's row is committed before its file is removed.
   So a crash or storage failure at the wrong moment can leave an orphaned file (logged with its
   key), never a row without its file. Deleting still answers `204` when the file can't be removed.
+  Requests end their read-only database transaction before calling storage, so a slow S3 doesn't
+  hold database connections (the pool is smaller than the threadpool) and block other endpoints.
 - **Downloads** stream the stored file in 64 KiB chunks with `Content-Length` and `Last-Modified`,
   and always release the file or S3 connection, even when the client disconnects. `Range` requests
   aren't supported: the whole image is sent, as HTTP allows.

@@ -194,8 +194,13 @@ def test_content_ignores_range_requests(client, auth_headers):
 
 
 def test_failed_commit_removes_the_stored_file(client, auth_headers, storage, monkeypatch):
+    commit = sqlalchemy.orm.Session.commit
+
     def failing_commit(self):
-        raise RuntimeError("database went away")
+        # Only the commit that inserts the image fails (not the read-only ones before it).
+        if self.new:
+            raise RuntimeError("database went away")
+        commit(self)
 
     monkeypatch.setattr(sqlalchemy.orm.Session, "commit", failing_commit)
 

@@ -10,6 +10,14 @@ os.environ["JWT_SECRET"] = "test-secret-that-is-at-least-32-characters-long"
 os.environ["REDIS_URL"] = ""
 # Keep images on local disk unless a test picks S3, and never probe for AWS instance metadata.
 os.environ["STORAGE_BACKEND"] = "local"
+for name in (
+    "S3_BUCKET",
+    "S3_ENDPOINT_URL",
+    "S3_REGION",
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+):
+    os.environ.pop(name, None)
 os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
 # Test the default rate limits whatever the developer's environment says.
 os.environ.pop("TRANSFORM_RATE_LIMIT_PER_MINUTE", None)

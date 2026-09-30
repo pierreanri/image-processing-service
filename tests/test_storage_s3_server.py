@@ -5,9 +5,9 @@ Uses TEST_S3_ENDPOINT_URL (default http://localhost:8333, the SeaweedFS started 
 creates) and TEST_S3_ACCESS_KEY_ID / TEST_S3_SECRET_ACCESS_KEY (default: compose's development
 keys). With REQUIRE_S3_TESTS=1 an unreachable server fails the tests instead of skipping them.
 
-Only a real server checks signatures and Content-MD5 (moto does neither). The tests only touch
-objects under random key prefixes and delete them afterwards; they never list, empty or delete
-the whole bucket.
+Only a real server checks signatures and Content-MD5 (moto does neither). The tests only list,
+write and delete objects under their own random key prefixes (so they need s3:ListBucket); they
+never empty or delete the bucket.
 """
 
 import os
@@ -48,7 +48,8 @@ def server_storage() -> S3Storage:
     url = urlsplit(TEST_S3_ENDPOINT_URL)
     try:
         # A quick TCP check first: with nothing listening, botocore would retry with backoff.
-        socket.create_connection((url.hostname, url.port or 80), timeout=0.5).close()
+        port = url.port or (443 if url.scheme == "https" else 80)
+        socket.create_connection((url.hostname, port), timeout=0.5).close()
         storage.client.head_bucket(Bucket=TEST_S3_BUCKET)
     except (OSError, botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError) as exc:
         message = f"S3 bucket {TEST_S3_BUCKET} not reachable at {TEST_S3_ENDPOINT_URL}: {exc}"

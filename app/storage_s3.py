@@ -7,9 +7,11 @@ import base64
 import hashlib
 from collections.abc import Iterator
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 
 import boto3
 import botocore.exceptions
+import urllib3.exceptions
 from botocore.client import BaseClient
 from botocore.config import Config
 
@@ -21,12 +23,16 @@ _RETRYABLE_CODES = {"RequestTimeout", "SlowDown"}
 
 
 def create_s3_client(settings: Settings) -> BaseClient:
-    """The process's S3 client: thread-safe, with its own connection pool. Sends no request.
+    """The process's S3 client: thread-safe, with its own connection pool. Sends no request to S3.
 
     Raises ValueError for an invalid S3_ENDPOINT_URL and PartialCredentialsError when only one of
-    S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY is set; with neither, boto3's default credential
-    chain is used (AWS_* variables, ~/.aws, instance or task roles).
+    S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY is set. With neither, boto3's default credential
+    chain (AWS_* variables, ~/.aws, instance or task roles) is resolved now, which may query the
+    instance metadata service; if it finds nothing, RuntimeError is raised, because a client
+    built without credentials would never look for them again.
     """
+    if settings.s3_endpoint_url:
+        _check_endpoint_url(settings.s3_endpoint_url)
     config = Config(
         # botocore waits 60 s by default; a stuck storage call holds one of the API's threads.
         connect_timeout=2,
@@ -44,7 +50,15 @@ def create_s3_client(settings: Settings) -> BaseClient:
         ignore_configured_endpoint_urls=True,
     )
     # Sessions aren't thread-safe, so this one is only used here, once.
-    return boto3.session.Session().client(
+    session = boto3.session.Session()
+    explicit_keys = settings.s3_access_key_id or settings.s3_secret_access_key
+    if not explicit_keys and session.get_credentials() is None:
+        raise RuntimeError(
+            "No S3 credentials found: set S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY, or configure "
+            "boto3's default chain (AWS_* variables, ~/.aws, an instance or task role)"
+        )
+    # The client reuses the credentials the session has just resolved.
+    return session.client(
         "s3",
         # Custom endpoints automatically get path-style URLs (endpoint/bucket/key).
         endpoint_url=settings.s3_endpoint_url or None,
@@ -53,6 +67,18 @@ def create_s3_client(settings: Settings) -> BaseClient:
         aws_secret_access_key=settings.s3_secret_access_key or None,
         config=config,
     )
+
+
+def _check_endpoint_url(url: str) -> None:
+    # botocore only checks the host when the client is built; a bad scheme or port would
+    # otherwise only fail on the first request.
+    parts = urlsplit(url)
+    try:
+        parts.port  # noqa: B018 (raises ValueError for a malformed or out-of-range port)
+    except ValueError as exc:
+        raise ValueError(f"Invalid S3_ENDPOINT_URL {url!r}: {exc}") from None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"Invalid S3_ENDPOINT_URL {url!r}: expected http(s)://host[:port]")
 
 
 class S3Storage:
@@ -100,6 +126,11 @@ def _s3_errors() -> Iterator[None]:
         botocore.exceptions.ConnectionError,
         botocore.exceptions.HTTPClientError,
         botocore.exceptions.IncompleteReadError,
+        # botocore passes these through untranslated (and unretried) when the connection fails
+        # while it reads a GetObject error body, or on a TLS error while an object is read.
+        urllib3.exceptions.ProtocolError,
+        urllib3.exceptions.TimeoutError,
+        urllib3.exceptions.SSLError,
     ) as exc:
         raise StorageUnavailableError(f"{type(exc).__name__}: {exc}") from exc
     except botocore.exceptions.ClientError as exc:

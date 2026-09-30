@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Fail fast on missing/invalid configuration instead of on the first request.
-    # (Building the Redis and S3 clients checks their settings but sends no request.)
+    # Fail fast on missing/invalid configuration instead of on the first request. Building the
+    # Redis and S3 clients checks their settings without contacting either service (though S3
+    # without explicit keys looks up credentials, e.g. from the instance metadata service).
     get_settings()
     get_storage()
     get_variant_cache()
