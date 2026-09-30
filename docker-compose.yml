@@ -33,6 +33,37 @@ services:
       # No password, so only reachable from this machine. Set REDIS_PORT if 6379 is taken.
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
 
+  # S3-compatible object storage for STORAGE_BACKEND=s3: SeaweedFS in its single-process "mini"
+  # mode, for development. Only started with the s3 profile (docker compose --profile s3 up, or
+  # COMPOSE_PROFILES=s3 in .env). It creates the "imgsvc" bucket for the API and "imgsvc-test"
+  # for tests/test_storage_s3_server.py, and only accepts requests signed with these keys.
+  s3:
+    image: chrislusf/seaweedfs:4.48
+    profiles: ["s3"]
+    command:
+      - mini
+      - -dir=/data
+      - -bucket=imgsvc,imgsvc-test
+      - -s3.autoCreateBucket=false
+      - -master.telemetry=false
+      - -admin.ui=false
+      - -webdav=false
+    environment:
+      AWS_ACCESS_KEY_ID: imgsvc
+      AWS_SECRET_ACCESS_KEY: imgsvc-dev-secret
+    volumes:
+      - s3data:/data
+    ports:
+      # Development keys, so only reachable from this machine. Set S3_PORT if 8333 is taken.
+      - "127.0.0.1:${S3_PORT:-8333}:8333"
+    healthcheck:
+      # Healthy once S3 answers and the API's bucket exists (checked through the internal filer).
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8333/healthz && curl -fsS -o /dev/null http://127.0.0.1:8888/buckets/imgsvc/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
   api:
     build: .
     depends_on:
@@ -42,12 +73,23 @@ services:
       # it to start.
       redis:
         condition: service_started
+      # Only with the s3 profile; needed when STORAGE_BACKEND=s3.
+      s3:
+        condition: service_healthy
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg://imgsvc:imgsvc@db:5432/imgsvc
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in your environment or in .env}
       REDIS_URL: redis://redis:6379/0
       TRANSFORM_RATE_LIMIT_PER_MINUTE: ${TRANSFORM_RATE_LIMIT_PER_MINUTE:-30}
       TRANSFORM_RATE_LIMIT_PER_HOUR: ${TRANSFORM_RATE_LIMIT_PER_HOUR:-500}
+      # Local disk (the images volume) unless STORAGE_BACKEND=s3, which uses the s3 service.
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      S3_ENDPOINT_URL: http://s3:8333
+      S3_REGION: us-east-1
+      S3_BUCKET: imgsvc
+      S3_ACCESS_KEY_ID: imgsvc
+      S3_SECRET_ACCESS_KEY: imgsvc-dev-secret
     volumes:
       - images:/data/storage
     ports:
@@ -56,3 +98,4 @@ services:
 volumes:
   pgdata:
   images:
+  s3data:
