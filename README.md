@@ -205,9 +205,11 @@ Unknown keys are rejected with `422`, so a typo never silently does nothing.
 ### Rate limits
 
 Only `POST /images/{id}/transform` is limited, per user account: by default 30 transformations per
-minute and 500 per hour. A request counts once it passes authentication, validation and the check
-that the image is yours, even if the transformation then fails; `401`, `422` and `404` responses
-and rejected requests don't count.
+minute and 500 per hour. A request counts once it passes authentication, request validation and the
+check that the image is yours, even if the transformation then fails (for example a `422` for a
+crop outside the image). Authentication failures (`401`), request-validation errors (`422` with a
+list of field errors), unknown or other users' images (`404`) and rejected requests (`429`) don't
+count.
 
 Successful transformations carry the current state of each limit (field syntax from the IETF
 [RateLimit header fields draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)):
@@ -269,7 +271,7 @@ enforced (Redis configured and reachable).
   any is used up. Fixed windows allow a burst of up to twice a limit around a window boundary (e.g.
   59 transformations within a second with the defaults). Limits are per account, don't bound
   concurrency, and `/register` isn't limited. If the connection breaks after Redis ran the script,
-  the retry can count that request twice.
+  the retry can use up one extra slot (the request is counted twice, or counted and then refused).
 - **Rate limits fail open**: while Redis is unreachable, slow or refusing commands, transformations
   are allowed without being counted (one warning per outage, then Redis is skipped for 5 seconds, as
   for the cache). Losing counters (a restart without persistence, eviction, a failover) only resets

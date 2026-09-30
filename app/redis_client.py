@@ -27,8 +27,8 @@ def create_redis_client(url: str, timeout_seconds: float) -> redis.Redis:
         socket_connect_timeout=timeout_seconds,
         socket_timeout=timeout_seconds,
         # One immediate retry on connection errors replaces a pooled socket that went stale.
-        # Cache commands are idempotent; a retried rate-limit script can at worst count one
-        # request twice. Timeouts are not retried.
+        # Cache commands are idempotent; a retried rate-limit script can at worst use up one
+        # extra slot. Timeouts are not retried.
         retry=Retry(NoBackoff(), 1, supported_errors=(redis.ConnectionError,)),
         # RESP2 skips the RESP3 HELLO and maintenance-notification handshake on each connection.
         protocol=2,

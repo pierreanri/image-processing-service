@@ -197,6 +197,28 @@ def test_success_of_a_call_started_before_a_failure_keeps_the_cooldown(
     assert limiter_log_levels(caplog) == ["WARNING"]
 
 
+@pytest.mark.parametrize(
+    "error", [redis.exceptions.OutOfMemoryError, redis.exceptions.ReadOnlyError]
+)
+def test_rejections_do_not_end_an_outage_of_refused_writes(
+    redis_mock, script, clock, caplog, error
+):
+    # A full or read-only Redis refuses the script's INCR but still answers the GET/PTTL of a
+    # rejection, so an over-limit user's retry must not count as Redis being back.
+    caplog.set_level(logging.DEBUG, logger="app.ratelimit")
+    limiter = RateLimiter(redis_mock, (MINUTE, HOUR), clock=clock)
+
+    for _ in range(2):
+        script.side_effect = error("refused")
+        assert limiter.hit(USER) is UNCHECKED
+        clock.advance(5.1)
+        script.side_effect = None
+        script.return_value = [0, 30, 20_000, 30, 3_000_000]
+        assert not limiter.hit(uuid.uuid4()).allowed
+
+    assert limiter_log_levels(caplog) == ["WARNING", "DEBUG"]
+
+
 def test_non_redis_errors_propagate(redis_mock, script):
     script.side_effect = ValueError("bug")
 

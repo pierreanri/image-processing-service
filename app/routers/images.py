@@ -182,8 +182,9 @@ def transform_image(
     over a limit the response is 429 with `Retry-After`.
     """
     source = _get_owned_image(db, user, image_id)
-    # Counted only once the request is authenticated, valid and about the user's own image
-    # (so 401/422/404 never use quota); a transformation that fails after this still counts.
+    # Counted only once the request is authenticated, schema-valid and about the user's own
+    # image (so 401, request-validation 422 and 404 never use quota); a transformation that
+    # fails after this (400/415/422) still counts.
     decision = rate_limiter.hit(user.id)
     if not decision.allowed:
         raise _too_many_transformations(decision)

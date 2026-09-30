@@ -31,9 +31,10 @@ def keys_of(user_id: uuid.UUID) -> tuple[str, str]:
 def limiter_must_reach_redis(caplog):
     # The limiter fails open, so a broken script or connection would otherwise just allow
     # every request; make any such failure fail the test instead.
+    # (Only the test body's records: setup may log that REDIS_URL isn't set for the app itself.)
     caplog.set_level(logging.WARNING, logger="app.ratelimit")
     yield
-    failures = [r.getMessage() for r in caplog.records if r.name == "app.ratelimit"]
+    failures = [r.getMessage() for r in caplog.get_records("call") if r.name == "app.ratelimit"]
     assert failures == []
 
 
@@ -62,18 +63,21 @@ def test_counts_until_the_limit_then_rejects_without_counting(redis_client, new_
     limiter = RateLimiter(redis_client, (Limit("minute", 3, 60), Limit("hour", 5, 3600)))
 
     remaining = [checked(limiter.hit(user_id)).states[0].remaining for _ in range(3)]
-    ttl_before_rejections = redis_client.pttl(minute_key)
+    assert 3_590_000 < redis_client.pttl(hour_key) <= 3_600_000
+    # Shorten both windows so that a rejection re-arming either TTL would show.
+    redis_client.pexpire(minute_key, 30_000)
+    redis_client.pexpire(hour_key, 1_800_000)
     rejections = [checked(limiter.hit(user_id)) for _ in range(2)]
 
     assert remaining == [2, 1, 0]
     for decision in rejections:
         assert not decision.allowed
-        assert 1 <= decision.retry_after_seconds <= 60
+        assert 1 <= decision.retry_after_seconds <= 30
     assert redis_client.get(minute_key) == b"3"
     assert redis_client.get(hour_key) == b"3"
     # Rejections neither count nor extend the window.
-    assert 0 < redis_client.pttl(minute_key) <= ttl_before_rejections
-    assert 3_590_000 < redis_client.pttl(hour_key) <= 3_600_000
+    assert 0 < redis_client.pttl(minute_key) <= 30_000
+    assert 0 < redis_client.pttl(hour_key) <= 1_800_000
 
 
 def test_used_up_hour_limit_does_not_consume_the_minute_limit(redis_client, new_user_id):

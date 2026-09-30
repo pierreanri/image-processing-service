@@ -145,8 +145,12 @@ class RateLimiter:
         except redis.RedisError as exc:
             self._outage.failed(exc)
             return UNCHECKED
-        self._outage.recovered(started)
-        return self._decision(reply)
+        decision = self._decision(reply)
+        # Only a counted request proves Redis accepts writes again: a rejection runs just
+        # GET and PTTL, which a full (noeviction) or read-only Redis still answers.
+        if decision.allowed:
+            self._outage.recovered(started)
+        return decision
 
     def _decision(self, reply: list[int]) -> RateLimitDecision:
         allowed, *counters = reply
