@@ -146,18 +146,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Storage is unavailable, stopping: {exc}", file=sys.stderr)
         return 1
 
-    found = f"{len(report.orphans)} orphaned files ({report.orphaned_bytes} bytes)"
-    summary = f"{found} among {report.scanned} files"
+    found = _files(len(report.orphans), "orphaned file")
+    summary = f"Found {found} ({report.orphaned_bytes} bytes) among {_files(report.scanned)}"
     if report.ignored:
-        summary += f"; ignored {report.ignored} files the service did not create"
-    print(summary)
+        summary += f"; ignored {_files(report.ignored)} the service did not create"
+    print(f"{summary}.")
     if not args.delete:
         if report.orphans:
             print("Dry run: nothing was deleted. Run again with --delete to delete them.")
-    elif failures:
+        return 0
+    if report.orphans:
+        print(f"Deleted {len(report.orphans) - failures} of them.")
+    if failures:
         print(f"Could not delete {failures} of them; see the errors above.", file=sys.stderr)
         return 1
     return 0
+
+
+def _files(count: int, noun: str = "file") -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
 def _grace_hours(value: str) -> timedelta:

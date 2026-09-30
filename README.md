@@ -16,6 +16,9 @@ optionally caches images converted on the fly and enforces per-user limits on tr
 - Transformations: crop, resize (`fill`/`contain`/`cover`), rotate, flip, mirror, grayscale, sepia,
   blur, sharpen, text watermark, format conversion and quality-based compression
 - Transformations are non-destructive: each one creates a new image linked to its source
+- Transformations run in the request, or in the background on request (`Prefer: respond-async`):
+  the API answers `202` with a job to poll, and worker processes run it, with retries and
+  takeover of jobs whose worker died
 - Image files on local disk (default) or in an S3-compatible bucket; downloads always stream
   through the API, with the same authentication, caching headers and conversions on both
 - Download images as stored, or converted on the fly with `?format=` and `?quality=`
@@ -26,6 +29,7 @@ optionally caches images converted on the fly and enforces per-user limits on tr
   Redis and are lifted (not enforced) while it is down
 - Long-lived `Cache-Control` headers and `ETag`/`If-None-Match` (304) support
 - Paginated image listing; users can only ever see their own images
+- A command that finds, and deletes, stored files no image refers to (left behind by crashes)
 - Interactive API docs at `/docs` (Swagger UI) and `/redoc`
 
 ## Quick start with Docker
@@ -36,8 +40,9 @@ docker compose up --build
 ```
 
 The API is then available at <http://localhost:8000> and the docs at <http://localhost:8000/docs>.
-Compose also starts PostgreSQL and Redis (for the conversion cache and the rate-limit counters).
-Database migrations run automatically when the API container starts. Images are stored in the
+Compose also starts PostgreSQL, Redis (for the conversion cache and the rate-limit counters) and a
+worker for background transformations. Database migrations run automatically when the API
+container starts. Images are stored in the
 `images` volume; to keep them in S3 instead, run SeaweedFS too with
 `COMPOSE_PROFILES=s3 STORAGE_BACKEND=s3 docker compose up --build` (or set both in `.env`).
 
@@ -53,6 +58,7 @@ pip install -e ".[dev]"
 cp .env.example .env          # adjust DATABASE_URL and JWT_SECRET
 alembic upgrade head          # create the tables
 uvicorn app.main:app --reload
+python -m app.worker          # in another terminal, for background transformations
 ```
 
 To run only the backing services in Docker: `docker compose up db redis`. The conversion cache and
@@ -86,6 +92,10 @@ Settings come from environment variables or a `.env` file.
 | `CACHE_MAX_ITEM_BYTES` | `5242880` (5 MB) | Conversions larger than this are served but not cached |
 | `TRANSFORM_RATE_LIMIT_PER_MINUTE` | `30` | Transformations each user may start per minute; `0` turns this limit off |
 | `TRANSFORM_RATE_LIMIT_PER_HOUR` | `500` | Transformations each user may start per hour; `0` turns this limit off |
+| `JOB_POLL_SECONDS` | `1.0` | How often an idle worker checks for background jobs |
+| `JOB_LEASE_SECONDS` | `300` | How long a job may run before another worker may take it over |
+| `JOB_MAX_ATTEMPTS` | `3` | Runs of a job (retries after storage outages, takeovers) before it fails |
+| `JOB_RETENTION_DAYS` | `7` | Finished jobs are deleted after this many days |
 
 Options in the query string of `REDIS_URL` override the client settings; don't set
 `decode_responses` there (the app refuses to start if you do). An unsupported scheme, a bad port,
@@ -99,8 +109,9 @@ instance metadata service), so a failed lookup makes the API exit and be restart
 without credentials. No request is sent to S3 itself at startup, so a wrong bucket name or wrong
 keys show up on the first upload or download (as a `500`, with the S3 error in the logs).
 `AWS_*` variables are only read from the real environment, never from `.env`, so put keys in
-`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` there. On AWS, the API needs `s3:GetObject`,
-`s3:PutObject` and `s3:DeleteObject` on `arn:aws:s3:::<bucket>/*`.
+`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` there. On AWS, the API and the worker need
+`s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `arn:aws:s3:::<bucket>/*`; the orphan sweep
+also needs `s3:ListBucket` on `arn:aws:s3:::<bucket>`.
 
 #### Switching an existing deployment to S3
 
@@ -128,6 +139,36 @@ SeaweedFS (bucket `imgsvc`; `S3_*` values in `.env` are ignored), so:
 2. `docker compose stop api`, then repeat both commands to pick up the last uploads.
 3. Set `STORAGE_BACKEND=s3` and `COMPOSE_PROFILES=s3` in `.env`, then `docker compose up -d`.
 4. Check a few downloads; the `images` volume keeps the old files until you remove it.
+
+### Background worker
+
+`python -m app.worker` runs the transformations requested with `Prefer: respond-async` (see
+[Background transformations](#background-transformations)); compose runs one as the `worker`
+service. Without a worker, such jobs stay queued. Each worker runs one job at a time, so run
+several for more throughput (`docker compose up --scale worker=3`); they share the queue safely. A
+worker needs the same settings as the API (database, storage) and waits at startup until the
+database is reachable and migrated. On `SIGTERM` or `Ctrl-C` it finishes its current job, then
+exits. It also deletes finished jobs older than `JOB_RETENTION_DAYS`, at startup and hourly.
+
+### Removing orphaned files
+
+A crash (or a storage error) at the wrong moment can leave a stored file that no image refers to;
+see [Design notes](#design-notes). `python -m app.sweep_orphans` lists such files, and deletes them
+with `--delete`:
+
+```bash
+python -m app.sweep_orphans                   # dry run: lists what it would delete
+python -m app.sweep_orphans --delete          # deletes them
+python -m app.sweep_orphans --grace-hours 72 --delete
+docker compose exec api python -m app.sweep_orphans --delete
+```
+
+Only files older than `--grace-hours` (default 24, at least 1) are considered, since a younger file
+may belong to an upload or a job that is about to commit. Files whose names the service would never
+have made (anything but `{user id}/{random}.{ext}` and its temporary files) are ignored and counted
+in the summary, so a directory or bucket shared with other data is safe. It exits with `1` if a
+deletion failed. It can run at any time, for example daily from cron:
+`17 4 * * * cd /srv/imgsvc && docker compose exec -T api python -m app.sweep_orphans --delete`.
 
 ### Tests and linting
 
@@ -161,8 +202,8 @@ ruff check . && ruff format --check .
 
 ## API
 
-All `/images` endpoints require an `Authorization: Bearer <token>` header. Requesting another
-user's image returns `404`, and too many transformations return `429` (see
+All `/images` and `/jobs` endpoints require an `Authorization: Bearer <token>` header. Requesting
+another user's image or job returns `404`, and too many transformations return `429` (see
 [Rate limits](#rate-limits)). Errors are returned as `{"detail": ...}`.
 
 | Method | Path | Description |
@@ -173,7 +214,8 @@ user's image returns `404`, and too many transformations return `429` (see
 | `GET` | `/images?page=1&limit=10` | List your images, newest first (`limit` ≤ 100) |
 | `GET` | `/images/{id}` | Get an image's metadata |
 | `GET` | `/images/{id}/content` | Download the image; optional `format` and `quality` query params (always the whole image: no `Range` or `HEAD`) |
-| `POST` | `/images/{id}/transform` | Transform an image into a new image |
+| `POST` | `/images/{id}/transform` | Transform an image into a new image (or, with `Prefer: respond-async`, start a job that does) |
+| `GET` | `/jobs/{id}` | Get a background transformation's status and, once done, its image |
 | `DELETE` | `/images/{id}` | Delete an image (images derived from it are kept) |
 | `GET` | `/health` | Health check |
 
@@ -260,6 +302,51 @@ watermark**, then the result is encoded.
 
 Unknown keys are rejected with `422`, so a typo never silently does nothing.
 
+### Background transformations
+
+By default a transformation runs within the request, which answers `201` with the new image. To
+run it in the background instead, send `Prefer: respond-async`
+([RFC 7240](https://www.rfc-editor.org/rfc/rfc7240)): the request is checked as usual (a `401`,
+`404`, `422` for an invalid body, or `429` creates no job) and answers `202` with a job, whose
+`Location` to poll. A [worker](#background-worker) must be running to process it.
+
+```bash
+curl -i -X POST localhost:8000/images/$ID/transform \
+  -H "Authorization: Bearer $TOKEN" -H 'Prefer: respond-async' -H 'Content-Type: application/json' \
+  -d '{"transformations": {"resize": {"width": 800}, "format": "webp"}}'
+# HTTP/1.1 202 Accepted
+# Location: http://localhost:8000/jobs/cf788b58-9f88-4db2-99b6-54478fc1918c
+# Preference-Applied: respond-async
+
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/jobs/cf788b58-9f88-4db2-99b6-54478fc1918c
+```
+
+```json
+{
+  "id": "cf788b58-9f88-4db2-99b6-54478fc1918c",
+  "url": "http://localhost:8000/jobs/cf788b58-9f88-4db2-99b6-54478fc1918c",
+  "status": "succeeded",
+  "source_image_id": "da4b22bb-cb6d-46c0-a125-d2d91c82dc7b",
+  "transformations": {"format": "webp", "resize": {"width": 800}},
+  "attempts": 1,
+  "created_at": "2026-09-30T13:57:37.290922Z",
+  "started_at": "2026-09-30T13:57:37.756847Z",
+  "finished_at": "2026-09-30T13:57:37.843719Z",
+  "result": {"id": "502a037b-a7a5-4ed3-88fd-cc6d50b38358", "url": "http://localhost:8000/images/502a037b-a7a5-4ed3-88fd-cc6d50b38358/content", "...": "..."},
+  "error": null
+}
+```
+
+`status` goes from `queued` to `running`, then `succeeded` (with the new image in `result`) or
+`failed` (with `error`: the `status_code` and `detail` the synchronous request would have answered,
+e.g. `422` for a crop outside the image, `404` if the source image was deleted meanwhile, or `503`
+if storage stayed unavailable through every retry). A job waiting to be retried after a storage
+outage is `queued` again, with that outage in `error`. While the job is unfinished, polling
+responses carry `Retry-After: 1`. If the new image has since been deleted, `result` is `null`. A job counts
+against the [rate limits](#rate-limits) when it is created, once.
+Finished jobs are kept for `JOB_RETENTION_DAYS` (7 by default), then `GET /jobs/{id}` answers `404`.
+The new image is an ordinary image, so it is still listed under `/images` after that.
+
 ### Rate limits
 
 Only `POST /images/{id}/transform` is limited, per user account: by default 30 transformations per
@@ -309,7 +396,7 @@ enforced (Redis configured and reachable).
 - **Storage and the database**: a new file is stored before its row is committed (if the commit
   fails, the file is deleted), and a deleted image's row is committed before its file is removed.
   So a crash or storage failure at the wrong moment can leave an orphaned file (logged with its
-  key), never a row without its file. Deleting still answers `204` when the file can't be removed.
+  key; see [Removing orphaned files](#removing-orphaned-files)), never a row without its file. Deleting still answers `204` when the file can't be removed.
   Requests end their read-only database transaction before calling storage, so a slow S3 doesn't
   hold database connections (the pool is smaller than the threadpool) and block other endpoints.
 - **Downloads** stream the stored file in 64 KiB chunks with `Content-Length` and `Last-Modified`,
@@ -366,6 +453,30 @@ enforced (Redis configured and reachable).
   rate limits. Keep it on a private network, require a password or ACL, and use `rediss://` across
   untrusted networks.
 
+- **Job queue** (`app/jobs.py`, `app/worker.py`): jobs are rows in PostgreSQL's `jobs` table, so
+  there is no extra service to run and a job is created in the same database as everything else.
+  Workers claim the oldest runnable job with `FOR UPDATE SKIP LOCKED` in one short transaction, so
+  any number of them share the table without blocking each other. They process it outside any
+  transaction (read the source, transform, store the result file), then insert the result image
+  and mark the job succeeded in one transaction.
+- **Job leases**: a claim is a lease of `JOB_LEASE_SECONDS`; the job's `available_at` holds its
+  deadline. If a worker dies, another one takes the job over once the lease has run out. Each
+  claim carries a fresh token and every change a worker makes to a job requires it, so a worker
+  that was merely slow can't finish (or fail) a job that was taken over: it deletes its result file
+  instead, and each job produces at most one image. A job claimed more than `JOB_MAX_ATTEMPTS` times
+  (its workers keep dying) fails with `500`, so a job that crashes its worker can't loop forever. Keep the lease well above the
+  slowest transformation.
+- **Job failures**: a transformation that doesn't fit the image fails at once, with the same status
+  and detail as the synchronous request. A storage outage puts the job back in the queue after
+  10 s, then 20 s, 40 s, … until `JOB_MAX_ATTEMPTS` runs, then fails it with `503`. Anything
+  unexpected is logged and fails the job with `500`. Database errors make the worker back off (up
+  to 30 s) and retry.
+- **Orphan sweep** (`app/sweep_orphans.py`): lists the storage (`list_files`) and checks the keys
+  against `images.storage_key` 1000 at a time. The grace period covers the gap between storing a
+  file and committing its row, which is at most a few seconds in practice; the one-hour minimum
+  leaves ample margin.
+
 ### Possible next steps
 
-Moving transformations to a background job queue, and a job that removes orphaned files.
+Listing a user's jobs and notifying clients when a job finishes (webhooks), per-user storage
+quotas, and signed URLs for sharing an image without a token.

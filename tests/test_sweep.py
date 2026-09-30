@@ -230,7 +230,7 @@ def test_command_dry_run_then_delete(cli, storage, auth_headers, client, capsys)
     out = capsys.readouterr().out
     assert f"would delete {old}" in out
     assert young not in out
-    assert "1 orphaned files (6 bytes) among 3 files" in out
+    assert "Found 1 orphaned file (6 bytes) among 3 files.\n" in out
     assert "Dry run: nothing was deleted" in out
     assert stored_keys(storage) == sorted([kept, old, young])
 
@@ -238,6 +238,7 @@ def test_command_dry_run_then_delete(cli, storage, auth_headers, client, capsys)
     out = capsys.readouterr().out
     assert f"deleted {old}" in out
     assert f"deleted {young}" in out
+    assert "Found 2 orphaned files (12 bytes) among 3 files.\nDeleted 2 of them.\n" in out
     assert "Dry run" not in out
     assert stored_keys(storage) == [kept]
 
@@ -249,7 +250,7 @@ def test_command_reports_ignored_files(cli, storage, capsys):
     assert cli() == 0
 
     out = capsys.readouterr().out
-    assert "0 orphaned files (0 bytes) among 1 files; ignored 1 files" in out
+    assert "Found 0 orphaned files (0 bytes) among 1 file; ignored 1 file the service" in out
     assert "Dry run" not in out
 
 
@@ -264,7 +265,7 @@ def test_command_rejects_bad_grace_periods(cli, capsys, value):
 
 
 @local_only
-def test_command_fails_when_deletions_fail(cli, storage, client, auth_headers, monkeypatch):
+def test_command_fails_when_deletions_fail(cli, storage, client, auth_headers, monkeypatch, capsys):
     key = orphan(storage, user_id_of(auth_headers))
     backdate(storage, key, hours=48)
 
@@ -275,6 +276,9 @@ def test_command_fails_when_deletions_fail(cli, storage, client, auth_headers, m
 
     assert cli("--delete") == 1
     assert stored_keys(storage) == [key]
+    out, err = capsys.readouterr()
+    assert "Deleted 0 of them." in out
+    assert "Could not delete 1 of them" in err
 
 
 @local_only

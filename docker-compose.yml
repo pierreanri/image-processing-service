@@ -1,3 +1,21 @@
+# Settings shared by the API and the worker.
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+psycopg://imgsvc:imgsvc@db:5432/imgsvc
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in your environment or in .env}
+  REDIS_URL: redis://redis:6379/0
+  TRANSFORM_RATE_LIMIT_PER_MINUTE: ${TRANSFORM_RATE_LIMIT_PER_MINUTE:-30}
+  TRANSFORM_RATE_LIMIT_PER_HOUR: ${TRANSFORM_RATE_LIMIT_PER_HOUR:-500}
+  # Local disk (the images volume) unless STORAGE_BACKEND=s3, which uses the s3 service.
+  STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+  S3_ENDPOINT_URL: http://s3:8333
+  S3_REGION: us-east-1
+  S3_BUCKET: imgsvc
+  S3_ACCESS_KEY_ID: imgsvc
+  S3_SECRET_ACCESS_KEY: imgsvc-dev-secret
+  JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
+  JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
+  JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-7}
+
 services:
   db:
     image: postgres:16
@@ -77,23 +95,28 @@ services:
       s3:
         condition: service_healthy
         required: false
-    environment:
-      DATABASE_URL: postgresql+psycopg://imgsvc:imgsvc@db:5432/imgsvc
-      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in your environment or in .env}
-      REDIS_URL: redis://redis:6379/0
-      TRANSFORM_RATE_LIMIT_PER_MINUTE: ${TRANSFORM_RATE_LIMIT_PER_MINUTE:-30}
-      TRANSFORM_RATE_LIMIT_PER_HOUR: ${TRANSFORM_RATE_LIMIT_PER_HOUR:-500}
-      # Local disk (the images volume) unless STORAGE_BACKEND=s3, which uses the s3 service.
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
-      S3_ENDPOINT_URL: http://s3:8333
-      S3_REGION: us-east-1
-      S3_BUCKET: imgsvc
-      S3_ACCESS_KEY_ID: imgsvc
-      S3_SECRET_ACCESS_KEY: imgsvc-dev-secret
+    environment: *app-environment
     volumes:
       - images:/data/storage
     ports:
       - "8000:8000"
+
+  # Runs the transformations requested with `Prefer: respond-async`, one at a time; add workers
+  # with `docker compose up --scale worker=3`. It waits for the API to create the jobs table.
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+        required: false
+    environment: *app-environment
+    volumes:
+      - images:/data/storage
+    # On `docker compose stop` the worker finishes its current job first.
+    stop_grace_period: 60s
 
 volumes:
   pgdata:
