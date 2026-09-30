@@ -5,7 +5,8 @@ images, apply transformations (resize, crop, rotate, watermark, flip, mirror, co
 format, filters) and download images in different formats.
 
 Built with **FastAPI**, **Pillow**, **SQLAlchemy 2** and **PostgreSQL**. Files are stored on the
-local disk; **Redis** optionally caches images converted on the fly.
+local disk; **Redis** optionally caches images converted on the fly and enforces per-user limits on
+transformations.
 
 ## Features
 
@@ -18,6 +19,9 @@ local disk; **Redis** optionally caches images converted on the fly.
 - Download images as stored, or converted on the fly with `?format=` and `?quality=`
 - Conversions are cached in Redis when `REDIS_URL` is set; Redis is optional and the service keeps
   working, uncached, without it or while it is down
+- Per-user rate limits on transformations (30 per minute and 500 per hour by default), counted in
+  Redis; over a limit the API answers `429` with `Retry-After`. Like the cache, the limits need
+  Redis and are lifted (not enforced) while it is down
 - Long-lived `Cache-Control` headers and `ETag`/`If-None-Match` (304) support
 - Paginated image listing; users can only ever see their own images
 - Interactive API docs at `/docs` (Swagger UI) and `/redoc`
@@ -30,8 +34,8 @@ docker compose up --build
 ```
 
 The API is then available at <http://localhost:8000> and the docs at <http://localhost:8000/docs>.
-Compose also starts PostgreSQL and a Redis conversion cache. Database migrations run automatically
-when the API container starts.
+Compose also starts PostgreSQL and Redis (for the conversion cache and the rate-limit counters).
+Database migrations run automatically when the API container starts.
 
 ## Local development
 
@@ -47,9 +51,10 @@ alembic upgrade head          # create the tables
 uvicorn app.main:app --reload
 ```
 
-To run only the backing services in Docker: `docker compose up db redis`. The conversion cache is
-off until you set `REDIS_URL=redis://localhost:6379/0` in `.env`. Without Docker, a suitable Redis
-is `redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --appendonly no`.
+To run only the backing services in Docker: `docker compose up db redis`. The conversion cache and
+the transform rate limits are off until you set `REDIS_URL=redis://localhost:6379/0` in `.env` (the
+app logs a warning at startup while limits are configured without it). Without Docker, a suitable
+Redis is `redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --appendonly no`.
 
 ### Configuration
 
@@ -64,10 +69,12 @@ Settings come from environment variables or a `.env` file.
 | `MAX_UPLOAD_BYTES` | `10485760` (10 MB) | Largest accepted upload |
 | `MAX_DIMENSION` | `10000` | Largest width/height a transformation may produce |
 | `MAX_IMAGE_PIXELS` | `50000000` | Largest pixel count accepted on upload |
-| `REDIS_URL` | *(empty: cache off)* | Redis for the conversion cache: `redis://`, `rediss://` (TLS) or `unix://` |
+| `REDIS_URL` | *(empty: both off)* | Redis for the conversion cache and the rate limits: `redis://`, `rediss://` (TLS) or `unix://` |
 | `REDIS_TIMEOUT_SECONDS` | `0.25` | Timeout for connecting to Redis and for each read or write |
 | `CACHE_TTL_SECONDS` | `86400` (1 day) | How long an image's cached conversions live after the last one was added |
 | `CACHE_MAX_ITEM_BYTES` | `5242880` (5 MB) | Conversions larger than this are served but not cached |
+| `TRANSFORM_RATE_LIMIT_PER_MINUTE` | `30` | Transformations each user may start per minute; `0` turns this limit off |
+| `TRANSFORM_RATE_LIMIT_PER_HOUR` | `500` | Transformations each user may start per hour; `0` turns this limit off |
 
 Options in the query string of `REDIS_URL` override the client settings; don't set
 `decode_responses` there (the app refuses to start if you do). An unsupported scheme, a bad port,
@@ -80,20 +87,25 @@ The test suite needs a PostgreSQL database it can freely wipe. By default it use
 `postgresql+psycopg://imgsvc:imgsvc@localhost:5432/imgsvc_test`; override it with the
 `TEST_DATABASE_URL` environment variable.
 
-It does not need Redis, and it ignores `REDIS_URL` from `.env`. The few tests in
-`tests/test_cache_redis.py` run against `TEST_REDIS_URL` (default `redis://localhost:6379/15`) and
-are skipped when that is unreachable; they only touch their own random keys and never flush.
+It does not need Redis, and it ignores `REDIS_URL` and the rate-limit settings from `.env`. The
+tests in `tests/test_cache_redis.py` and `tests/test_ratelimit_redis.py` run against
+`TEST_REDIS_URL` (default `redis://localhost:6379/15`) and are skipped when that is unreachable;
+they only touch their own random keys and never flush. They are the only tests that run the rate
+limiter's Lua script, so run them before changing `app/ratelimit.py`: with
+`REQUIRE_REDIS_TESTS=1` they fail instead of being skipped when Redis is missing.
 
 ```bash
 createdb imgsvc_test          # or: docker compose up db, then create it with psql
 pytest -rs                    # -rs shows why any tests were skipped
+REQUIRE_REDIS_TESTS=1 pytest  # with Redis running, e.g. docker compose up -d redis
 ruff check . && ruff format --check .
 ```
 
 ## API
 
 All `/images` endpoints require an `Authorization: Bearer <token>` header. Requesting another
-user's image returns `404`. Errors are returned as `{"detail": ...}`.
+user's image returns `404`, and too many transformations return `429` (see
+[Rate limits](#rate-limits)). Errors are returned as `{"detail": ...}`.
 
 | Method | Path | Description |
 |---|---|---|
@@ -190,6 +202,36 @@ watermark**, then the result is encoded.
 
 Unknown keys are rejected with `422`, so a typo never silently does nothing.
 
+### Rate limits
+
+Only `POST /images/{id}/transform` is limited, per user account: by default 30 transformations per
+minute and 500 per hour. A request counts once it passes authentication, validation and the check
+that the image is yours, even if the transformation then fails; `401`, `422` and `404` responses
+and rejected requests don't count.
+
+Successful transformations carry the current state of each limit (field syntax from the IETF
+[RateLimit header fields draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)):
+
+```
+RateLimit-Policy: "minute";q=30;w=60, "hour";q=500;w=3600
+RateLimit: "minute";r=18;t=34, "hour";r=460;t=1800
+```
+
+`q` is the limit, `w` the window in seconds, `r` the requests left and `t` the seconds until that
+window resets. Over a limit the response is `429` with the same fields plus `Retry-After`, the
+seconds until every exhausted limit has reset:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 13
+RateLimit: "minute";r=0;t=13, "hour";r=469;t=3000
+
+{"detail": "Too many transformations (limit: 30 per minute); retry in 13s"}
+```
+
+Clients should tolerate these headers being absent: they are only sent while the limits are
+enforced (Redis configured and reachable).
+
 ## Design notes
 
 - **Layout**: `app/imaging.py` holds all Pillow logic and has no web or database dependencies;
@@ -220,15 +262,30 @@ Unknown keys are rejected with `422`, so a typo never silently does nothing.
   - Redis answering but refusing writes (full under `noeviction`, or a read-only replica): one
     warning; cached conversions are still served, new ones are not cached.
   - A write that times out (a large conversion on a slow link) is simply not cached.
-- **Cache timeouts**: `REDIS_TIMEOUT_SECONDS` bounds each connection attempt, read and write. A
-  hostname with several addresses is tried one address at a time, and name resolution isn't
-  covered, so point `REDIS_URL` at an IP or a reliable resolver for a remote Redis. The timeout must
-  also cover sending `CACHE_MAX_ITEM_BYTES` to Redis (5 MB in 0.25 s needs about 200 Mbit/s); for
-  a remote Redis, raise the timeout or lower the cap.
-- **Cache security**: whoever can write to Redis can change the bytes the API serves. Keep it on a
-  private network, require a password or ACL, and use `rediss://` across untrusted networks.
+- **Rate limiting** (`app/ratelimit.py`): each limit is a fixed window that starts with a user's
+  first counted transformation and ends when its Redis key
+  (`imgsvc:ratelimit:v1:transform:{user id}:minute|hour`) expires, so every API instance agrees.
+  One Lua script checks every limit and counts the request against all of them, or against none if
+  any is used up. Fixed windows allow a burst of up to twice a limit around a window boundary (e.g.
+  59 transformations within a second with the defaults). Limits are per account, don't bound
+  concurrency, and `/register` isn't limited. If the connection breaks after Redis ran the script,
+  the retry can count that request twice.
+- **Rate limits fail open**: while Redis is unreachable, slow or refusing commands, transformations
+  are allowed without being counted (one warning per outage, then Redis is skipped for 5 seconds, as
+  for the cache). Losing counters (a restart without persistence, eviction, a failover) only resets
+  windows early. Keep `allkeys-lru` (or `volatile-lru`); never `volatile-ttl`, which would evict the
+  counters before cached conversions. A Redis ACL user needs `+get +incr +expire +pttl +evalsha
+  +script|load` on `~imgsvc:*` for the limiter (plus the hash commands for the cache).
+- **Redis timeouts**: `REDIS_TIMEOUT_SECONDS` bounds each connection attempt, read and write, for
+  both the cache and the limiter. While Redis stops answering, requests already in flight each wait
+  up to that long before it is skipped. A hostname with several addresses is tried one address at a
+  time, and name resolution isn't covered, so point `REDIS_URL` at an IP or a reliable resolver for a
+  remote Redis. The timeout must also cover sending `CACHE_MAX_ITEM_BYTES` to Redis (5 MB in 0.25 s
+  needs about 200 Mbit/s); for a remote Redis, raise the timeout or lower the cap.
+- **Redis security**: whoever can write to Redis can change the bytes the API serves and lift the
+  rate limits. Keep it on a private network, require a password or ACL, and use `rediss://` across
+  untrusted networks.
 
 ### Possible next steps
 
-Rate limiting transformations, S3-compatible storage, and moving transformations to a background
-job queue.
+S3-compatible storage, and moving transformations to a background job queue.
