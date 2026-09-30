@@ -5,8 +5,12 @@ plain copy. The S3 backend lives in app/storage_s3.py and is only imported when 
 """
 
 import os
+import re
+import stat
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import BinaryIO, Protocol
@@ -41,6 +45,14 @@ class FileStream:
         self._file.close()
 
 
+@dataclass(frozen=True)
+class StoredFile:
+    key: str
+    size: int
+    # When the file was written, in UTC.
+    last_modified: datetime
+
+
 class Storage(Protocol):
     def save(self, key: str, data: bytes, *, content_type: str) -> None:
         """Store data under key; readers never see a partially written file."""
@@ -52,6 +64,10 @@ class Storage(Protocol):
 
     def delete(self, key: str) -> None:
         """Delete a file; a missing key is not an error."""
+
+    def list_files(self) -> Iterator[StoredFile]:
+        """Every stored file, in no particular order, including leftovers such as temporary
+        files (see app/sweep_orphans.py)."""
 
 
 class LocalStorage:
@@ -89,6 +105,29 @@ class LocalStorage:
 
     def delete(self, key: str) -> None:
         self.path(key).unlink(missing_ok=True)
+
+    def list_files(self) -> Iterator[StoredFile]:
+        # os.walk skips directories it can't read, and doesn't follow symlinks to directories.
+        for directory, _, names in os.walk(self.root):
+            for name in names:
+                path = Path(directory, name)
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue  # Deleted since the directory was read.
+                # Symlinks and the like are never the service's: delete() would follow them.
+                if stat.S_ISREG(info.st_mode):
+                    yield StoredFile(
+                        key=path.relative_to(self.root).as_posix(),
+                        size=info.st_size,
+                        last_modified=datetime.fromtimestamp(info.st_mtime, UTC),
+                    )
+
+
+_OWNER_DIR = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/"
+# The keys build_key makes, and the names of LocalStorage.save's temporary files for them.
+SERVICE_KEY = re.compile(rf"{_OWNER_DIR}[0-9a-f]{{32}}\.[a-z0-9]+")
+SERVICE_TEMP_KEY = re.compile(rf"{_OWNER_DIR}\.[0-9a-f]{{32}}\.[a-z0-9]+\.[0-9a-f]{{32}}\.tmp")
 
 
 def build_key(owner_id: uuid.UUID, extension: str) -> str:

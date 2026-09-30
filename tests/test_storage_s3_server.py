@@ -91,6 +91,9 @@ def test_save_read_stream_and_delete(server_storage, new_key):
     head = server_storage.client.head_object(Bucket=TEST_S3_BUCKET, Key=key)
     assert head["ContentType"] == "image/png"
 
+    listed = [file for file in server_storage.list_files() if file.key == key]
+    assert [file.size for file in listed] == [len(data)]
+
     server_storage.delete(key)
     server_storage.delete(key)
     with pytest.raises(botocore.exceptions.ClientError) as missing:

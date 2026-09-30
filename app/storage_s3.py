@@ -7,6 +7,7 @@ import base64
 import hashlib
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC
 from urllib.parse import urlsplit
 
 import boto3
@@ -16,7 +17,7 @@ from botocore.client import BaseClient
 from botocore.config import Config
 
 from app.config import Settings
-from app.storage import FileStream, StorageUnavailableError
+from app.storage import FileStream, StorageUnavailableError, StoredFile
 
 # S3 answers that mean "try again later" even though their status is not 5xx or 429.
 _RETRYABLE_CODES = {"RequestTimeout", "SlowDown"}
@@ -113,6 +114,17 @@ class S3Storage:
     def delete(self, key: str) -> None:
         with _s3_errors():
             self.client.delete_object(Bucket=self.bucket, Key=key)
+
+    def list_files(self) -> Iterator[StoredFile]:
+        # Needs the s3:ListBucket permission, which nothing else here does.
+        with _s3_errors():
+            for page in self.client.get_paginator("list_objects_v2").paginate(Bucket=self.bucket):
+                for item in page.get("Contents", []):
+                    yield StoredFile(
+                        key=item["Key"],
+                        size=item["Size"],
+                        last_modified=item["LastModified"].astimezone(UTC),
+                    )
 
 
 @contextmanager

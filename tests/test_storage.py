@@ -5,6 +5,7 @@ import io
 import os
 import threading
 import uuid
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import botocore.exceptions
@@ -90,6 +91,22 @@ def test_delete_removes_the_file_and_ignores_missing_keys(any_storage):
     assert stored_keys(any_storage) == []
 
 
+def test_list_files_lists_every_file_with_its_size_and_time(any_storage):
+    assert list(any_storage.list_files()) == []
+    other_key = f"{uuid.uuid4()}/{uuid.uuid4().hex}.webp"
+    before = datetime.now(UTC) - timedelta(seconds=5)
+    any_storage.save(KEY, b"12345", content_type="image/png")
+    any_storage.save(other_key, b"123", content_type="image/webp")
+    after = datetime.now(UTC) + timedelta(seconds=5)
+
+    files = sorted(any_storage.list_files(), key=lambda file: file.key)
+
+    assert [(file.key, file.size) for file in files] == sorted([(KEY, 5), (other_key, 3)])
+    for file in files:
+        assert file.last_modified.utcoffset() == timedelta(0)
+        assert before <= file.last_modified <= after
+
+
 def test_a_missing_file_is_an_error_not_an_outage(any_storage):
     for operation in (any_storage.read, any_storage.open):
         with pytest.raises(Exception) as error:
@@ -170,10 +187,12 @@ def test_custom_endpoints_get_path_style_urls():
 def call(storage: S3Storage, operation: str):
     if operation == "save":
         return storage.save(KEY, b"data", content_type="image/png")
+    if operation == "list_files":
+        return list(storage.list_files())
     return getattr(storage, operation)(KEY)
 
 
-@pytest.mark.parametrize("operation", ["save", "read", "open", "delete"])
+@pytest.mark.parametrize("operation", ["save", "read", "open", "delete", "list_files"])
 @pytest.mark.parametrize(
     "error",
     [
@@ -200,6 +219,13 @@ def test_transient_errors_mean_storage_is_unavailable(operation, error):
     client = MagicMock()
     for method in ("put_object", "get_object", "delete_object"):
         getattr(client, method).side_effect = error
+
+    def failing_pages(**kwargs):
+        # Like boto3's, the page iterator only sends requests as it is iterated.
+        raise error
+        yield
+
+    client.get_paginator.return_value.paginate.side_effect = failing_pages
 
     with pytest.raises(StorageUnavailableError) as raised:
         call(S3Storage(client, "imgsvc"), operation)
@@ -230,6 +256,43 @@ def test_other_errors_are_raised_unchanged(error):
         S3Storage(client, "imgsvc").read(KEY)
 
     assert raised.value is error
+
+
+def test_list_files_reads_every_page():
+    client = MagicMock()
+    modified = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone(timedelta(hours=2)))
+    client.get_paginator.return_value.paginate.return_value = iter(
+        [
+            {"Contents": [{"Key": "a", "Size": 1, "LastModified": modified}]},
+            {"Contents": [{"Key": "b", "Size": 2, "LastModified": modified}]},
+            {},  # An empty bucket's page has no Contents.
+        ]
+    )
+
+    files = list(S3Storage(client, "imgsvc").list_files())
+
+    client.get_paginator.assert_called_once_with("list_objects_v2")
+    client.get_paginator.return_value.paginate.assert_called_once_with(Bucket="imgsvc")
+    assert [file.key for file in files] == ["a", "b"]
+    assert [file.size for file in files] == [1, 2]
+    assert files[0].last_modified == modified
+    assert files[0].last_modified.tzinfo is UTC
+
+
+def test_local_list_files_includes_temporary_files_and_skips_symlinks(local_storage):
+    local_storage.save(KEY, b"data", content_type="image/png")
+    temp_key = f"{KEY.split('/')[0]}/.{uuid.uuid4().hex}.png.{uuid.uuid4().hex}.tmp"
+    local_storage.path(temp_key).write_bytes(b"partial")
+    (local_storage.root / "link.png").symlink_to(local_storage.path(KEY))
+    (local_storage.root / "linked-dir").symlink_to(local_storage.path(KEY).parent)
+
+    keys = sorted(file.key for file in local_storage.list_files())
+
+    assert keys == sorted([KEY, temp_key])
+
+
+def test_local_list_files_on_a_missing_directory_is_empty(tmp_path):
+    assert list(LocalStorage(tmp_path / "nothing-here").list_files()) == []
 
 
 # --- Configuration --------------------------------------------------------------------------------
