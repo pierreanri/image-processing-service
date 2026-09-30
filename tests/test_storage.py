@@ -342,7 +342,7 @@ def test_delete_is_204_even_if_the_file_cannot_be_removed(
     assert response.status_code == 204
     assert client.get(f"/images/{image['id']}", headers=auth_headers).status_code == 404
     assert variant_cache.entries == {}
-    errors = [r for r in caplog.records if r.name == "app.routers.images"]
+    errors = [r for r in caplog.records if r.name == "app.transforms"]
     assert [r.levelname for r in errors] == ["ERROR"]
     assert key in errors[0].getMessage()
 
@@ -367,7 +367,7 @@ def test_failed_cleanup_does_not_hide_the_database_error(
     with pytest.raises(RuntimeError, match="database went away"):
         upload(client, auth_headers)
 
-    assert [r.levelname for r in caplog.records if r.name == "app.routers.images"] == ["ERROR"]
+    assert [r.levelname for r in caplog.records if r.name == "app.transforms"] == ["ERROR"]
 
 
 def test_downloads_close_the_stored_file(client, auth_headers, storage):

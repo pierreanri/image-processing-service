@@ -1,0 +1,41 @@
+"""Response bodies shared by the image and job routers."""
+
+from fastapi import Request
+
+from app.models import Image, Job
+from app.schemas import ImageOut, JobError, JobOut
+
+
+def image_out(image: Image, request: Request) -> ImageOut:
+    return ImageOut(
+        id=image.id,
+        parent_id=image.parent_id,
+        url=str(request.url_for("get_image_content", image_id=image.id)),
+        original_filename=image.original_filename,
+        format=image.format,
+        mime_type=image.mime_type,
+        width=image.width,
+        height=image.height,
+        size_bytes=image.size_bytes,
+        transformations=image.transformations,
+        created_at=image.created_at,
+    )
+
+
+def job_out(job: Job, request: Request, result: Image | None) -> JobOut:
+    error = None
+    if job.error_status is not None:
+        error = JobError(status_code=job.error_status, detail=job.error_detail or "")
+    return JobOut(
+        id=job.id,
+        url=str(request.url_for("get_job", job_id=job.id)),
+        status=job.status,
+        source_image_id=job.source_image_id,
+        transformations=job.transformations,
+        attempts=job.attempts,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        result=image_out(result, request) if result is not None else None,
+        error=error,
+    )

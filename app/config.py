@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     transform_rate_limit_per_minute: int = Field(default=30, ge=0)
     transform_rate_limit_per_hour: int = Field(default=500, ge=0)
 
+    # Background transformations (POST /images/{id}/transform with Prefer: respond-async).
+    # How often an idle worker looks for jobs.
+    job_poll_seconds: float = Field(default=1.0, gt=0)
+    # How long a worker may hold a job before another worker may take it over.
+    job_lease_seconds: int = Field(default=300, gt=0)
+    # Runs of a job (including retries after storage outages) before it is failed.
+    job_max_attempts: int = Field(default=3, ge=1)
+    # Finished jobs are deleted after this many days.
+    job_retention_days: int = Field(default=7, gt=0)
+
 
 @lru_cache
 def get_settings() -> Settings:

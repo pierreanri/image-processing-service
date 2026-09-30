@@ -32,13 +32,14 @@ from moto import mock_aws  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
 from app.cache import get_variant_cache  # noqa: E402
-from app.config import Settings  # noqa: E402
-from app.db import Base, get_engine  # noqa: E402
+from app.config import Settings, get_settings  # noqa: E402
+from app.db import Base, get_engine, get_sessionmaker  # noqa: E402
 from app.main import app  # noqa: E402
 from app.ratelimit import get_transform_rate_limiter  # noqa: E402
 from app.redis_client import create_redis_client  # noqa: E402
 from app.storage import LocalStorage, get_storage  # noqa: E402
 from app.storage_s3 import S3Storage, create_s3_client  # noqa: E402
+from app.worker import Worker  # noqa: E402
 from tests.utils import (  # noqa: E402
     FakeClock,
     FakeRateLimiter,
@@ -120,6 +121,12 @@ def client(clean_db, storage, variant_cache, rate_limiter):
 @pytest.fixture
 def auth_headers(client) -> dict:
     return register(client)
+
+
+@pytest.fixture
+def worker(client, storage) -> Worker:
+    """A job worker on the test database and the test's storage; call run_once() to run a job."""
+    return Worker(get_sessionmaker(), storage, get_settings())
 
 
 @pytest.fixture

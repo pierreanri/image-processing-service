@@ -1,4 +1,3 @@
-import logging
 import math
 import re
 import uuid
@@ -6,7 +5,7 @@ from email.utils import formatdate
 from typing import Annotated
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, select
 from starlette.types import Receive, Scope, Send
 
@@ -19,12 +18,20 @@ from app.deps import (
     VariantCacheDep,
 )
 from app.imaging import DEFAULT_QUALITY, FORMATS, apply_transformations, load_image
+from app.jobs import enqueue
 from app.models import Image, User
 from app.ratelimit import RateLimitDecision
-from app.schemas import ImageFormat, ImageList, ImageOut, TransformationSpec, TransformRequest
-from app.storage import FileStream, Storage, build_key
-
-logger = logging.getLogger(__name__)
+from app.routers.views import image_out, job_out
+from app.schemas import (
+    ImageFormat,
+    ImageList,
+    ImageOut,
+    JobOut,
+    TransformationSpec,
+    TransformRequest,
+)
+from app.storage import FileStream, build_key
+from app.transforms import discard_file, persist_image, release_connection, render_transformation
 
 router = APIRouter(prefix="/images", tags=["images"])
 
@@ -63,8 +70,8 @@ def upload_image(
         height=loaded.image.height,
         size_bytes=len(data),
     )
-    _persist(db, storage, image, data)
-    return _to_out(image, request)
+    persist_image(db, storage, image, data)
+    return image_out(image, request)
 
 
 @router.get("")
@@ -85,7 +92,7 @@ def list_images(
         .limit(limit)
     ).all()
     return ImageList(
-        items=[_to_out(image, request) for image in images],
+        items=[image_out(image, request) for image in images],
         page=page,
         limit=limit,
         total=total,
@@ -95,7 +102,7 @@ def list_images(
 
 @router.get("/{image_id}")
 def get_image(image_id: uuid.UUID, request: Request, user: CurrentUser, db: DbSession) -> ImageOut:
-    return _to_out(_get_owned_image(db, user, image_id), request)
+    return image_out(_get_owned_image(db, user, image_id), request)
 
 
 @router.get(
@@ -136,7 +143,7 @@ def get_image_content(
     headers = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
     if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
-    _release_connection(db)
+    release_connection(db)
 
     if variant is None:
         headers["Last-Modified"] = formatdate(image.created_at.timestamp(), usegmt=True)
@@ -160,6 +167,17 @@ def get_image_content(
     "/{image_id}/transform",
     status_code=status.HTTP_201_CREATED,
     responses={
+        202: {
+            "model": JobOut,
+            "description": "Queued as a background job (sent `Prefer: respond-async`).",
+            "headers": {
+                "Location": {"description": "Where to poll the job.", "schema": {"type": "string"}},
+                "Preference-Applied": {
+                    "description": "`respond-async`",
+                    "schema": {"type": "string"},
+                },
+            },
+        },
         429: {
             "description": "Too many transformations; retry after `Retry-After` seconds.",
             "headers": {
@@ -168,7 +186,7 @@ def get_image_content(
                     "schema": {"type": "integer"},
                 }
             },
-        }
+        },
     },
 )
 def transform_image(
@@ -187,9 +205,12 @@ def transform_image(
     The source image is left untouched; the new image records it as its `parent_id`.
     Transformations are rate limited per user (by default 30 per minute and 500 per hour);
     over a limit the response is 429 with `Retry-After`.
+
+    With `Prefer: respond-async` the transformation runs in the background instead: the
+    response is 202 with a job to poll at its `Location` (GET /jobs/{id}).
     """
     source = _get_owned_image(db, user, image_id)
-    _release_connection(db)
+    release_connection(db)
     # Counted only once the request is authenticated, schema-valid and about the user's own
     # image (so 401, request-validation 422 and 404 never use quota); a transformation that
     # fails after this (400/415/422) still counts.
@@ -198,23 +219,21 @@ def transform_image(
         raise _too_many_transformations(decision)
     response.headers.update(decision.headers())
 
-    loaded = load_image(storage.read(source.storage_key), settings.max_image_pixels)
-    result = apply_transformations(loaded, body.transformations, settings.max_dimension)
+    if _prefers_async(request.headers.getlist("prefer")):
+        job = enqueue(db, user.id, source.id, body.transformations)
+        return JSONResponse(
+            job_out(job, request, None).model_dump(mode="json"),
+            status_code=status.HTTP_202_ACCEPTED,
+            headers={
+                **decision.headers(),
+                "Location": str(request.url_for("get_job", job_id=job.id)),
+                "Preference-Applied": "respond-async",
+            },
+        )
 
-    image = Image(
-        owner_id=user.id,
-        parent_id=source.id,
-        storage_key=build_key(user.id, result.extension),
-        original_filename=_with_extension(source.original_filename, result.extension),
-        format=result.format,
-        mime_type=result.mime_type,
-        width=result.width,
-        height=result.height,
-        size_bytes=len(result.data),
-        transformations=body.transformations.model_dump(mode="json", exclude_defaults=True),
-    )
-    _persist(db, storage, image, result.data)
-    return _to_out(image, request)
+    image, data = render_transformation(storage, settings, source, body.transformations, user.id)
+    persist_image(db, storage, image, data)
+    return image_out(image, request)
 
 
 @router.delete("/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -231,11 +250,22 @@ def delete_image(
     db.delete(image)
     db.commit()
     # The image is gone for the API now; failing to remove its file only wastes space.
-    _discard(storage, storage_key)
+    discard_file(storage, storage_key)
     # After the commit, so a failed delete never drops a valid cache. Leftovers (Redis down,
     # or a conversion racing the delete) can't be served, because the image lookup 404s first,
     # and they expire with the TTL.
     cache.invalidate(image_id)
+
+
+def _prefers_async(prefer_headers: list[str]) -> bool:
+    """Whether the Prefer headers (RFC 7240) include `respond-async`; its parameters, and other
+    preferences such as `wait`, are ignored."""
+    for header in prefer_headers:
+        for preference in header.split(","):
+            name = preference.split(";", 1)[0].split("=", 1)[0].strip().lower()
+            if name == "respond-async":
+                return True
+    return False
 
 
 def _too_many_transformations(decision: RateLimitDecision) -> HTTPException:
@@ -255,36 +285,6 @@ def _get_owned_image(db: DbSession, user: User, image_id: uuid.UUID) -> Image:
     return image
 
 
-def _release_connection(db: DbSession) -> None:
-    """End the request's read-only transaction so its pooled connection isn't held while
-    storage (possibly S3, over the network) is slow: the DB pool is smaller than the
-    threadpool, and running out would break endpoints that never touch storage. Loaded
-    objects stay usable (expire_on_commit=False) and a later query checks out a connection
-    again."""
-    db.commit()
-
-
-def _persist(db: DbSession, storage: Storage, image: Image, data: bytes) -> None:
-    _release_connection(db)
-    # File first: a crash in between leaves an orphaned file, never a row without its file.
-    storage.save(image.storage_key, data, content_type=image.mime_type)
-    db.add(image)
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
-        _discard(storage, image.storage_key)
-        raise
-
-
-def _discard(storage: Storage, key: str) -> None:
-    """Delete a file whose image is gone, logging (not raising) a failure."""
-    try:
-        storage.delete(key)
-    except Exception:
-        logger.exception("Could not delete image file %s; it is left orphaned", key)
-
-
 class _StoredFileResponse(StreamingResponse):
     """Streams an open stored file with its Content-Length, and always closes it, even when the
     client disconnects halfway (which releases the file or the S3 connection straight away)."""
@@ -302,31 +302,10 @@ class _StoredFileResponse(StreamingResponse):
             self._file.close()
 
 
-def _to_out(image: Image, request: Request) -> ImageOut:
-    return ImageOut(
-        id=image.id,
-        parent_id=image.parent_id,
-        url=str(request.url_for("get_image_content", image_id=image.id)),
-        original_filename=image.original_filename,
-        format=image.format,
-        mime_type=image.mime_type,
-        width=image.width,
-        height=image.height,
-        size_bytes=image.size_bytes,
-        transformations=image.transformations,
-        created_at=image.created_at,
-    )
-
-
 def _clean_filename(filename: str | None, extension: str) -> str:
     # Keep only the final path component; browsers on Windows may send full paths.
     name = re.split(r"[\\/]", filename or "")[-1].strip()
     return name[:255] or f"upload.{extension}"
-
-
-def _with_extension(filename: str, extension: str) -> str:
-    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
-    return f"{stem[: 254 - len(extension)]}.{extension}"
 
 
 def _etag_matches(if_none_match: str | None, etag: str) -> bool:

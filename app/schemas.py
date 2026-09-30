@@ -152,3 +152,28 @@ class ImageList(BaseModel):
     limit: int
     total: int
     pages: int
+
+
+class JobError(BaseModel):
+    status_code: int = Field(description="The HTTP status the synchronous request would have had.")
+    detail: str
+
+
+class JobOut(BaseModel):
+    id: uuid.UUID
+    url: str = Field(description="Where to poll this job.")
+    status: Literal["queued", "running", "succeeded", "failed"]
+    source_image_id: uuid.UUID | None = Field(
+        description="The image being transformed (null once it has been deleted)."
+    )
+    transformations: dict[str, Any]
+    attempts: int = Field(description="How many times a worker has started this job.")
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    result: ImageOut | None = Field(
+        description="The new image, once the job has succeeded (null if it was since deleted)."
+    )
+    error: JobError | None = Field(
+        description="Why the job failed, or the last error of a job waiting to be retried."
+    )

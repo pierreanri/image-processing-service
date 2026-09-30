@@ -9,7 +9,7 @@ from app.cache import get_variant_cache
 from app.config import get_settings
 from app.imaging import ImageProcessingError
 from app.ratelimit import get_transform_rate_limiter
-from app.routers import auth, images
+from app.routers import auth, images, jobs
 from app.storage import StorageUnavailableError, get_storage
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(auth.router)
     app.include_router(images.router)
+    app.include_router(jobs.router)
 
     @app.exception_handler(ImageProcessingError)
     async def image_processing_error(request: Request, exc: ImageProcessingError) -> JSONResponse:
