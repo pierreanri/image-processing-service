@@ -94,3 +94,10 @@ def get_shared_image(
         cache=cache,
         conversion_slots=conversion_slots,
     )
+
+
+@router.get("/{rest:path}", include_in_schema=False)
+def unknown_shared_path(rest: str) -> None:
+    """Any other path under /shared, such as a link that lost its extension: answered like a link
+    this service didn't issue."""
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "Share link not found", headers=_ERROR_HEADERS)

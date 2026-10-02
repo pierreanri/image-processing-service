@@ -143,6 +143,23 @@ def test_resize_above_max_dimension_is_rejected():
         transform(make_image_bytes(), resize={"width": MAX_DIMENSION + 1})
 
 
+@pytest.mark.parametrize(("format", "limit"), [("webp", 16_383), ("jpeg", 65_500), ("gif", 65_535)])
+def test_formats_whose_encoders_cap_the_size_are_rejected_not_crashed(format, limit):
+    """With MAX_DIMENSION raised beyond what the encoder takes, saving would fail with a 500."""
+    wide = load(make_image_bytes(size=(limit + 1, 1)))
+
+    with pytest.raises(TransformationError, match=f"maximum dimension of {limit}px for {format}"):
+        apply_transformations(wide, TransformationSpec(format=format), limit + 100)
+
+    # The limit itself is fine, and so is the same size in a format without such a cap.
+    exact = load(make_image_bytes(size=(limit, 1)))
+    assert (
+        apply_transformations(exact, TransformationSpec(format=format), limit + 100).width == limit
+    )
+    png = apply_transformations(wide, TransformationSpec(format="png"), limit + 100)
+    assert png.width == limit + 1
+
+
 def test_rotate_right_angle_swaps_dimensions():
     result = transform(two_tone(), rotate=90)
 

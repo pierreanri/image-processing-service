@@ -34,6 +34,14 @@ FORMATS: dict[str, FormatInfo] = {
 _PILLOW_TO_FORMAT = {info.pillow_name: name for name, info in FORMATS.items()} | {"MPO": "jpeg"}
 
 DEFAULT_QUALITY = {"jpeg": 85, "webp": 80}
+# The largest width/height Pillow's encoders accept; beyond these, saving fails.
+ENCODER_MAX_DIMENSION = {"jpeg": 65_500, "webp": 16_383, "gif": 65_535}
+
+
+def max_output_dimension(image_format: str, max_dimension: int) -> int:
+    """The largest width/height a transformation may produce in `image_format`: MAX_DIMENSION, or
+    less if the format's encoder can't go that far."""
+    return min(max_dimension, ENCODER_MAX_DIMENSION.get(image_format, max_dimension))
 
 
 class ImageProcessingError(Exception):
@@ -145,13 +153,15 @@ def apply_transformations(
     if spec.watermark is not None:
         image = _watermark(image, spec.watermark)
 
-    if image.width > max_dimension or image.height > max_dimension:
+    image_format = spec.format or loaded.format
+    limit = max_output_dimension(image_format, max_dimension)
+    if image.width > limit or image.height > limit:
         raise TransformationError(
             f"Resulting image {image.width}x{image.height} exceeds the maximum dimension "
-            f"of {max_dimension}px"
+            f"of {limit}px" + ("" if limit == max_dimension else f" for {image_format}")
         )
 
-    return encode_image(image, spec.format or loaded.format, spec.quality)
+    return encode_image(image, image_format, spec.quality)
 
 
 def encode_image(image: Image.Image, image_format: str, quality: int | None = None) -> EncodedImage:

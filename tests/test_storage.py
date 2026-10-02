@@ -383,6 +383,9 @@ def test_storage_outage_is_503(client, auth_headers, storage, caplog, operation,
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Image storage is temporarily unavailable"}
+    assert response.headers["retry-after"] == "5"
+    assert response.headers["cache-control"] == "no-store"
+    assert "access-control-allow-origin" not in response.headers  # only share links get it
     assert [r.levelname for r in caplog.records if r.name == "app.main"] == ["WARNING"]
     if operation == "upload":
         assert client.get("/images", headers=auth_headers).json()["total"] == 0

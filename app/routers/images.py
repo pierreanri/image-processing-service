@@ -16,7 +16,7 @@ from app.deps import (
     TransformRateLimiterDep,
     VariantCacheDep,
 )
-from app.imaging import FORMATS, load_image
+from app.imaging import FORMATS, load_image, max_output_dimension
 from app.jobs import enqueue
 from app.models import Image, User
 from app.ratelimit import RateLimitDecision
@@ -244,7 +244,7 @@ def create_share_link(
     target_format, quality, variant = image_variant(image.format, body.format, body.quality)
     # Every download through such a link would fail (see load_image and apply_transformations).
     too_large = (
-        max(image.width, image.height) > settings.max_dimension
+        max(image.width, image.height) > max_output_dimension(target_format, settings.max_dimension)
         or image.width * image.height > settings.max_image_pixels
     )
     if variant is not None and too_large:

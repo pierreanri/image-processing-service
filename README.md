@@ -454,8 +454,10 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   The API masks the secret part of tokens in its access log and warnings
   (`/shared/Afy3_PoR_EZ-leX7kFw7MzAAAAAAashe8QIA[redacted].webp`), but reverse proxies, browser history and chat apps
   keep whole URLs. The token is signed, not encrypted: it reveals the image id and the expiry.
-- Stored files are shared as uploaded, including their EXIF metadata (such as GPS position);
-  share a conversion (e.g. `"format": "webp"`) to send a re-encoded copy without it.
+- Stored files are shared as uploaded, including their EXIF metadata (such as GPS position). To
+  send a re-encoded copy without it, share the image converted to another format, or with a
+  `quality` for JPEG or WebP; asking for the stored format without a quality shares the stored
+  file.
 - Downloads through links that need a conversion not in the cache are limited per API process
   (`SHARE_MAX_CONCURRENT_CONVERSIONS`): an embedded link can have many anonymous viewers. For
   heavily viewed images, share a transformed image (its stored file is streamed, never
@@ -485,9 +487,9 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   and always release the file or S3 connection, even when the client disconnects. `Range` requests
   aren't supported: the whole image is sent, as HTTP allows.
 - **Storage failures**: when S3 is unreachable, times out, throttles or returns `5xx` (after
-  retries), the request answers `503`; a missing object, a missing bucket or denied access is a
-  `500`. A failure halfway through a download aborts the connection, so the client sees a body
-  shorter than `Content-Length` rather than a silently short file.
+  retries), the request answers `503` with `Retry-After: 5`; a missing object, a missing bucket or
+  denied access is a `500`. A failure halfway through a download aborts the connection, so the
+  client sees a body shorter than `Content-Length` rather than a silently short file.
 - **S3 client**: 2 s connect and 10 s read timeouts, 3 attempts in standard retry mode (up to about
   30 s per call while S3 is unreachable; the retry quota cuts that during a long outage) and a pool
   of 64 connections, shared by all threads. Custom endpoints get path-style URLs, and
@@ -571,13 +573,15 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   increments in SQL; a link works only while it carries the current value. Unlike comparing
   issue and revocation times, this needs no clock, so it can't be fooled by clock skew between
   API instances or two events in the same second. Restoring a database backup rolls the counters
-  back and so revives links revoked since: afterwards, change `JWT_SECRET`, or run
+  back and so revives links revoked since, and downgrading past migration 0003 and upgrading again
+  resets them all to 0: afterwards, change `JWT_SECRET`, or run
   `UPDATE images SET share_generation = share_generation + 1000000` (adding 1 can revive links
   revoked in between). Revoking takes a lock that doesn't conflict with a job's result insert.
 - **Share-link conversions**: conversions through links that miss the cache wait for one of
   `SHARE_MAX_CONCURRENT_CONVERSIONS` slots per process (a semaphore; only as many requests as there
   are slots may wait, up to 5 s, since each holds an API thread), and look in the cache again once
-  they have one, so a crowd on an uncached variant converts it once. The limit needs no Redis, so
+  they have one, so a crowd on an uncached variant converts it at most
+  `SHARE_MAX_CONCURRENT_CONVERSIONS` times per process (when the result can be cached). The limit needs no Redis, so
   it holds when the cache is down. `/content` conversions aren't limited.
 - **Orphan sweep** (`app/sweep_orphans.py`): lists the storage (`list_files`) and checks the keys
   against `images.storage_key` 1000 at a time. The grace period covers the gap between storing a

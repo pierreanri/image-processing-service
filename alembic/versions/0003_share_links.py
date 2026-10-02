@@ -1,5 +1,9 @@
 """Add images.share_generation for revoking share links.
 
+Downgrading drops the counters, and upgrading again starts them all at 0, which revives every
+revoked link that hasn't expired yet: afterwards, change JWT_SECRET (or see the README's note on
+restoring a backup).
+
 Revision ID: 0003
 Revises: 0002
 Create Date: 2026-10-02

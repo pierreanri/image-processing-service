@@ -59,7 +59,13 @@ def create_app() -> FastAPI:
     async def storage_unavailable(request: Request, exc: StorageUnavailableError) -> JSONResponse:
         path = redact_share_tokens(request.url.path)
         logger.warning("Image storage unavailable (%s %s): %s", request.method, path, exc)
-        return JSONResponse({"detail": "Image storage is temporarily unavailable"}, status_code=503)
+        headers = {"Retry-After": "5", "Cache-Control": "no-store"}
+        if request.url.path.startswith(f"{shared.router.prefix}/"):
+            # Like every other answer to a share link, readable from any page.
+            headers["Access-Control-Allow-Origin"] = "*"
+        return JSONResponse(
+            {"detail": "Image storage is temporarily unavailable"}, status_code=503, headers=headers
+        )
 
     @app.exception_handler(ConversionsBusyError)
     async def conversions_busy(request: Request, exc: ConversionsBusyError) -> JSONResponse:

@@ -201,6 +201,20 @@ def test_conversion_links_downloads_could_never_serve_are_refused(
     assert share(client, auth_headers, image["id"])["format"] == "png"
 
 
+def test_conversion_links_beyond_the_encoders_limit_are_refused(
+    client, auth_headers, signer, settings
+):
+    settings.max_dimension = 20_000  # above WebP's limit of 16383 px
+    image = upload(client, auth_headers, make_image_bytes(size=(16_384, 2)))
+
+    response = client.post(
+        f"/images/{image['id']}/share-links", headers=auth_headers, json={"format": "webp"}
+    )
+
+    assert response.status_code == 422
+    assert share(client, auth_headers, image["id"], format="tiff")["format"] == "tiff"
+
+
 def test_only_the_owner_can_create_or_revoke_links(client, auth_headers, signer):
     image = upload(client, auth_headers)
     link = share(client, auth_headers, image["id"])
@@ -482,6 +496,31 @@ def test_a_link_grants_nothing_else_and_tells_nothing_about_its_owner(
     assert rejected.headers["www-authenticate"] == "Bearer"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/shared/{token}",  # cut before its extension
+        "/shared/{token}.",
+        "/shared/{token}.webp/",
+        "/shared/Afy3_PoR_EZ-leX7kFw7Mz",  # cut inside the token
+        "/shared/",
+        "/shared/a/b/c",
+    ],
+)
+def test_other_paths_under_shared_get_the_same_404(client, auth_headers, signer, path):
+    image = upload(client, auth_headers)
+    token = token_of(share(client, auth_headers, image["id"], format="webp")["url"])
+    statements = count_statements()
+
+    response = client.get(path.format(token=token))
+
+    assert statements() == 0
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Share link not found"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
 def test_an_invalid_authorization_header_is_ignored(client, auth_headers, signer):
     image = upload(client, auth_headers)
     link = share(client, auth_headers, image["id"])
@@ -567,6 +606,9 @@ def test_a_storage_outage_is_503_and_the_log_hides_the_link(
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Image storage is temporarily unavailable"}
+    assert response.headers["retry-after"] == "5"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["access-control-allow-origin"] == "*"
     [record] = [record for record in caplog.records if record.name == "app.main"]
     token = token_of(link["url"])
     assert f"/shared/{token[:36]}[redacted]" in record.getMessage()
