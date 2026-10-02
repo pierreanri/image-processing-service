@@ -16,6 +16,8 @@ x-app-environment: &app-environment
   JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-300}
   JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
   JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-7}
+  SHARE_MAX_TTL_SECONDS: ${SHARE_MAX_TTL_SECONDS:-2592000}
+  SHARE_MAX_CONCURRENT_CONVERSIONS: ${SHARE_MAX_CONCURRENT_CONVERSIONS:-2}
 
 services:
   db:
@@ -103,7 +105,7 @@ services:
       - "8000:8000"
 
   # Runs the transformations requested with `Prefer: respond-async`, one at a time; add workers
-  # with `docker compose up --scale worker=3`. It waits for the API to create the jobs table.
+  # with `docker compose up --scale worker=3`. It waits for the API to migrate the database.
   worker:
     build: .
     command: ["python", "-m", "app.worker"]

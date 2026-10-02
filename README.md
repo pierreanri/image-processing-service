@@ -22,12 +22,16 @@ optionally caches images converted on the fly and enforces per-user limits on tr
 - Image files on local disk (default) or in an S3-compatible bucket; downloads always stream
   through the API, with the same authentication, caching headers and conversions on both
 - Download images as stored, or converted on the fly with `?format=` and `?quality=`
+- Share links: signed, expiring URLs (1 day by default, up to 30 days) that download one image, as
+  stored or converted, without a token, to embed in a web page or send to someone. Revoking an
+  image's links ends all of them at once
 - Conversions are cached in Redis when `REDIS_URL` is set; Redis is optional and the service keeps
   working, uncached, without it or while it is down
 - Per-user rate limits on transformations (30 per minute and 500 per hour by default), counted in
   Redis; over a limit the API answers `429` with `Retry-After`. Like the cache, the limits need
   Redis and are lifted (not enforced) while it is down
-- Long-lived `Cache-Control` headers and `ETag`/`If-None-Match` (304) support
+- Long-lived `Cache-Control` headers (shorter for share links) and `ETag`/`If-None-Match` (304)
+  support
 - Paginated image listing; users can only ever see their own images
 - A command that finds, and deletes, stored files no image refers to (left behind by crashes)
 - Interactive API docs at `/docs` (Swagger UI) and `/redoc`
@@ -75,7 +79,7 @@ Settings come from environment variables or a `.env` file.
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `postgresql+psycopg://imgsvc:imgsvc@localhost:5432/imgsvc` | SQLAlchemy database URL |
-| `JWT_SECRET` | *(required)* | Secret used to sign tokens, at least 32 characters |
+| `JWT_SECRET` | *(required)* | Secret used to sign tokens and share links, at least 32 characters; changing it logs everyone out and ends every share link |
 | `JWT_EXPIRE_MINUTES` | `60` | Access token lifetime |
 | `STORAGE_BACKEND` | `local` | Where image files are stored: `local` or `s3` |
 | `STORAGE_DIR` | `./storage` | Directory for image files (local backend) |
@@ -96,6 +100,8 @@ Settings come from environment variables or a `.env` file.
 | `JOB_LEASE_SECONDS` | `300` | How long a worker may take over a job; a longer run's result is discarded and the job is run again (keep it well above the slowest transformation, and below the sweep's `--grace-hours`) |
 | `JOB_MAX_ATTEMPTS` | `3` | Runs of a job (retries after storage outages, takeovers) before it fails |
 | `JOB_RETENTION_DAYS` | `7` | Finished jobs are deleted after this many days |
+| `SHARE_MAX_TTL_SECONDS` | `2592000` (30 days) | Longest lifetime a share link may be given (at most a year); links last 1 day by default, or this if shorter |
+| `SHARE_MAX_CONCURRENT_CONVERSIONS` | `2` | Conversions that downloads through share links may run at once per API process; as many more wait up to 5 s, the rest get `503` |
 
 Options in the query string of `REDIS_URL` override the client settings; don't set
 `decode_responses` there (the app refuses to start if you do). An unsupported scheme, a bad port,
@@ -148,7 +154,8 @@ SeaweedFS (bucket `imgsvc`; `S3_*` values in `.env` are ignored), so:
 service. Without a worker, such jobs stay queued. Each worker runs one job at a time, so run
 several for more throughput (`docker compose up --scale worker=3`); they share the queue safely. A
 worker needs the same settings as the API (database, storage) and waits at startup until the
-database is reachable and migrated. On `SIGTERM` or `Ctrl-C` it finishes its current job, then
+database is reachable and has every table and column it uses (the API container runs the
+migrations). On `SIGTERM` or `Ctrl-C` it finishes its current job, then
 exits. It also deletes finished jobs older than `JOB_RETENTION_DAYS`, at startup and hourly.
 
 ### Removing orphaned files
@@ -205,8 +212,9 @@ ruff check . && ruff format --check .
 
 ## API
 
-All `/images` and `/jobs` endpoints require an `Authorization: Bearer <token>` header. Requesting
-another user's image or job returns `404`, and too many transformations return `429` (see
+All `/images` and `/jobs` endpoints require an `Authorization: Bearer <token>` header; share
+links (`/shared/...`) need none, since the link itself is the credential. Requesting another
+user's image or job returns `404`, and too many transformations return `429` (see
 [Rate limits](#rate-limits)). Errors are returned as `{"detail": ...}`.
 
 | Method | Path | Description |
@@ -219,6 +227,9 @@ another user's image or job returns `404`, and too many transformations return `
 | `GET` | `/images/{id}/content` | Download the image; optional `format` and `quality` query params (always the whole image: no `Range` or `HEAD`) |
 | `POST` | `/images/{id}/transform` | Transform an image into a new image (or, with `Prefer: respond-async`, start a job that does) |
 | `GET` | `/jobs/{id}` | Get a background transformation's status and, once done, its image |
+| `POST` | `/images/{id}/share-links` | Create a share link: a URL that downloads the image without a token (see [Share links](#share-links)) |
+| `DELETE` | `/images/{id}/share-links` | Revoke every share link to the image created so far |
+| `GET` | `/shared/{token}.{ext}` | Download an image through a share link (no `Authorization` header) |
 | `DELETE` | `/images/{id}` | Delete an image (images derived from it are kept) |
 | `GET` | `/health` | Health check |
 
@@ -382,6 +393,74 @@ RateLimit: "minute";r=0;t=13, "hour";r=469;t=3000
 Clients should tolerate these headers being absent: they are only sent while the limits are
 enforced (Redis configured and reachable).
 
+### Share links
+
+A share link downloads one of your images without a token, for an `<img>` on a web page or to send
+to someone. It serves the image as stored, or converted with `format` and `quality` exactly as
+`/content?format=&quality=` would, and works until it expires or you revoke it:
+
+```bash
+curl -X POST localhost:8000/images/$ID/share-links \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"format": "webp", "expires_in": 604800}'
+```
+
+```json
+{
+  "url": "http://localhost:8000/shared/Afy3_PoR_EZ-leX7kFw7MzAAAAAAashe8QIAX2CygY5FfMgkX5CSOU2kgmtj.webp",
+  "image_id": "fcb7fcfa-11fc-467e-95e5-fb905c3b3330",
+  "format": "webp",
+  "mime_type": "image/webp",
+  "quality": null,
+  "expires_at": "2026-10-09T03:26:41Z"
+}
+```
+
+```bash
+curl -o cat.webp "$URL"      # the link's url: no token needed
+curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $TOKEN"
+```
+
+- The body is optional. `format` and `quality` are as for `/content`; `expires_in` (seconds) or
+  `expires_at` (an RFC 3339 time with a time zone) sets the expiry: 1 day by default, at most
+  `SHARE_MAX_TTL_SECONDS` (30 days by default). A longer lifetime is refused with `422`, not
+  shortened. `quality` is dropped for lossless formats, and asking for the stored format without a
+  quality gives a link to the stored file.
+- Nothing is stored per link, and links are deterministic: the same image, variant and expiry
+  always give the same URL. A page that creates links as it renders can pass a fixed `expires_at`
+  (say, the end of the week) to keep the same URL, and with it the browser cache.
+- Revoking (`DELETE`) ends every link to the image created so far; links created afterwards work.
+  A link created while a revocation is in progress may already be revoked. Deleting the image
+  ends its links too, and changing `JWT_SECRET` ends every link (and every session).
+- Downloads through links answer:
+
+  | Status | When |
+  |---|---|
+  | `200` | The image, streamed or converted (conversions are cached like `/content`'s) |
+  | `304` | `If-None-Match` matches |
+  | `404` `{"detail": "Share link not found"}` | Not a link this service issued: changed, truncated, or another extension |
+  | `410` `{"detail": "Share link expired at 2026-10-09T03:26:41Z"}` | Expired |
+  | `410` `{"detail": "Share link has been revoked"}` | Revoked, or the image was deleted (a link never tells which) |
+  | `503` with `Retry-After` | Storage unavailable, or too many conversions in progress |
+
+  `HEAD` isn't supported (`405`), and the query string is ignored.
+- Responses are `Cache-Control: private, max-age=` at most an hour (less when the link expires
+  sooner), so no proxy or CDN keeps serving a revoked link, and a browser checks again at least
+  hourly (a cheap `304`). They can be embedded or fetched from any page
+  (`Access-Control-Allow-Origin: *`, `Cross-Origin-Resource-Policy: cross-origin`), are marked
+  `noindex`, and save as `image.<ext>`. When an `<img>` gets an error, ask your backend for a
+  fresh link.
+- A link is a password: anyone who has it can download the image until it expires or is revoked.
+  The API masks the secret part of tokens in its access log and warnings
+  (`/shared/Afy3_PoR_EZ-leX7kFw7MzAAAAAAashe8QIA[redacted].webp`), but reverse proxies, browser history and chat apps
+  keep whole URLs. The token is signed, not encrypted: it reveals the image id and the expiry.
+- Stored files are shared as uploaded, including their EXIF metadata (such as GPS position);
+  share a conversion (e.g. `"format": "webp"`) to send a re-encoded copy without it.
+- Downloads through links that need a conversion not in the cache are limited per API process
+  (`SHARE_MAX_CONCURRENT_CONVERSIONS`): an embedded link can have many anonymous viewers. For
+  heavily viewed images, share a transformed image (its stored file is streamed, never
+  re-encoded), and consider a per-IP rate limit on `/shared/` at your reverse proxy.
+
 ## Design notes
 
 - **Layout**: `app/imaging.py` holds all Pillow logic and has no web or database dependencies;
@@ -418,8 +497,8 @@ enforced (Redis configured and reachable).
 - **Conversion cache** (`app/cache.py`): each image's conversions live in one Redis hash,
   `imgsvc:variants:v1:{image id}`, whose fields are the ETag variants (`webp-qdefault`, `jpeg-q40`,
   …). Lossless formats ignore `quality`, so they get one entry and one ETag. The cache is only read
-  after the ownership check, the `304` check and the original-file check, so it can never serve one
-  user's image to another. Deleting an image drops its hash; if that fails (Redis down), the
+  after the ownership (or share-link) check, the `304` check and the original-file check, so it can
+  never serve one user's image to another. Deleting an image drops its hash; if that fails (Redis down), the
   leftover can't be served and expires with the TTL. Bump `v1` when encoder output changes.
 - **Cache memory**: the TTL is refreshed whenever a conversion is added, entries over
   `CACHE_MAX_ITEM_BYTES` are skipped, and the total is bounded by Redis itself. Run Redis with
@@ -479,6 +558,27 @@ enforced (Redis configured and reachable).
 - **Lock order**: completing a job inserts the result image (whose foreign key locks the source
   image) before updating the job row, the same order in which deleting the source image locks
   the image and then clears the job's `source_image_id`, so the two can't deadlock.
+- **Share links** (`app/sharing.py`, `app/routers/shared.py`): a token is a 27-byte payload
+  (version, image id, the image's share generation, expiry in Unix seconds, format code,
+  quality) followed by the first 18 bytes of its HMAC-SHA256, base64url-encoded: 45 bytes are
+  exactly 60 characters, so each link has one spelling, and the first 36 are the payload. The key
+  is derived from `JWT_SECRET` under its own label, so a JWT signature can never pass for a link's
+  tag or the other way round. A download checks the token's shape, its tag (in constant time),
+  its extension and its expiry without any I/O, then loads the image (one primary-key lookup) and
+  compares the generation; only then can it answer `304`. The format and quality are inside the
+  signed payload, so a link's holder can only get the variant its owner chose.
+- **Revoking share links**: each image has a `share_generation` counter, which revoking
+  increments in SQL; a link works only while it carries the current value. Unlike comparing
+  issue and revocation times, this needs no clock, so it can't be fooled by clock skew between
+  API instances or two events in the same second. Restoring a database backup rolls the counters
+  back and so revives links revoked since: afterwards, change `JWT_SECRET`, or run
+  `UPDATE images SET share_generation = share_generation + 1000000` (adding 1 can revive links
+  revoked in between). Revoking takes a lock that doesn't conflict with a job's result insert.
+- **Share-link conversions**: conversions through links that miss the cache wait for one of
+  `SHARE_MAX_CONCURRENT_CONVERSIONS` slots per process (a semaphore; only as many requests as there
+  are slots may wait, up to 5 s, since each holds an API thread), and look in the cache again once
+  they have one, so a crowd on an uncached variant converts it once. The limit needs no Redis, so
+  it holds when the cache is down. `/content` conversions aren't limited.
 - **Orphan sweep** (`app/sweep_orphans.py`): lists the storage (`list_files`) and checks the keys
   against `images.storage_key` 1000 at a time. The grace period covers the gap between storing a
   file and committing its row: a few seconds in practice, and for a job at most its lease.
@@ -486,4 +586,4 @@ enforced (Redis configured and reachable).
 ### Possible next steps
 
 Listing a user's jobs and notifying clients when a job finishes (webhooks), per-user storage
-quotas, and signed URLs for sharing an image without a token.
+quotas, and a limit on the conversions of authenticated downloads like the one for share links.
