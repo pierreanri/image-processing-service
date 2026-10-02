@@ -19,6 +19,7 @@ from app.deps import (
 from app.imaging import FORMATS, load_image, max_output_dimension
 from app.jobs import enqueue
 from app.models import Image, User
+from app.quota import check_quota
 from app.ratelimit import RateLimitDecision
 from app.routers.downloads import image_variant, send_image
 from app.routers.views import image_out, job_out, share_link_out
@@ -43,7 +44,16 @@ router = APIRouter(prefix="/images", tags=["images"])
 CACHE_CONTROL = "private, max-age=31536000, immutable"
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        403: {
+            "description": "Storage quota exceeded: the new image doesn't fit in your remaining "
+            "storage (see GET /me).",
+        },
+    },
+)
 def upload_image(
     request: Request,
     file: Annotated[UploadFile, File(description="The image file to upload.")],
@@ -73,7 +83,7 @@ def upload_image(
         height=loaded.image.height,
         size_bytes=len(data),
     )
-    persist_image(db, storage, image, data)
+    persist_image(db, storage, settings, image, data)
     return image_out(image, request)
 
 
@@ -151,6 +161,10 @@ def get_image_content(
     "/{image_id}/transform",
     status_code=status.HTTP_201_CREATED,
     responses={
+        403: {
+            "description": "Storage quota exceeded: the new image doesn't fit in your remaining "
+            "storage (see GET /me).",
+        },
         202: {
             "model": JobOut,
             "description": "Queued as a background job (sent `Prefer: respond-async`).",
@@ -188,16 +202,21 @@ def transform_image(
 
     The source image is left untouched; the new image records it as its `parent_id`.
     Transformations are rate limited per user (by default 30 per minute and 500 per hour);
-    over a limit the response is 429 with `Retry-After`.
+    over a limit the response is 429 with `Retry-After`. A result that doesn't fit in your
+    storage quota is refused with 403.
 
     With `Prefer: respond-async` the transformation runs in the background instead: the
     response is 202 with a job to poll at its `Location` (GET /jobs/{id}).
     """
     source = _get_owned_image(db, user, image_id)
+    # An account that is already full can't take any result: refused before rendering, before
+    # counting against the rate limits, and without queuing a job.
+    check_quota(db, settings, user.id, None)
     release_connection(db)
     # Counted only once the request is authenticated, schema-valid and about the user's own
-    # image (so 401, request-validation 422 and 404 never use quota); a transformation that
-    # fails after this (400/415/422) still counts.
+    # image, with room in their storage (so 401, request-validation 422, 404 and those 403s never
+    # count); a transformation that fails after this (400/415/422, or a 403 because its result
+    # doesn't fit) still counts.
     decision = rate_limiter.hit(user.id)
     if not decision.allowed:
         raise _too_many_transformations(decision)
@@ -216,7 +235,7 @@ def transform_image(
         )
 
     image, data = render_transformation(storage, settings, source, body.transformations, user.id)
-    persist_image(db, storage, image, data)
+    persist_image(db, storage, settings, image, data)
     return image_out(image, request)
 
 

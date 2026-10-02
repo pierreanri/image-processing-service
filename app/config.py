@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # last 1 day by default (or this, if shorter). They are signed with a key derived from
     # JWT_SECRET, so changing it ends every link.
     share_max_ttl_seconds: int = Field(default=30 * 24 * 60 * 60, gt=0, le=365 * 24 * 60 * 60)
+    # How many bytes of images each user may store, unless they have a limit of their own
+    # (python -m app.quota set); 0 means no limit.
+    storage_quota_bytes: int = Field(default=1024**3, ge=0)
+
     # Conversions (format/quality) that downloads through share links may run at once in each
     # API process; as many more wait up to 5 s for a slot, the rest get 503.
     share_max_concurrent_conversions: int = Field(default=2, gt=0)

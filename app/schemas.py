@@ -40,6 +40,20 @@ class RegisterResponse(TokenResponse):
     user: UserOut
 
 
+class StorageOut(BaseModel):
+    used_bytes: int = Field(
+        description="The total size of your images: uploads and transformation results."
+    )
+    limit_bytes: int | None = Field(description="How much you may store; null: no limit.")
+    available_bytes: int | None = Field(
+        description="How much more you may store (0 once at or over the limit); null: no limit."
+    )
+
+
+class MeOut(UserOut):
+    storage: StorageOut
+
+
 # --- Images -------------------------------------------------------------------------------------
 
 FORMAT_ALIASES = {"jpg": "jpeg", "tif": "tiff"}

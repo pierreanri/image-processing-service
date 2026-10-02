@@ -3,9 +3,18 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings
-from app.deps import DbSession, SettingsDep
+from app.deps import CurrentUser, DbSession, SettingsDep
 from app.models import User
-from app.schemas import LoginRequest, RegisterRequest, RegisterResponse, TokenResponse, UserOut
+from app.quota import Usage, quota_limit, storage_used
+from app.schemas import (
+    LoginRequest,
+    MeOut,
+    RegisterRequest,
+    RegisterResponse,
+    StorageOut,
+    TokenResponse,
+    UserOut,
+)
 from app.security import create_access_token, hash_password, verify_password
 
 router = APIRouter(tags=["auth"])
@@ -41,3 +50,19 @@ def login(body: LoginRequest, db: DbSession, settings: SettingsDep) -> TokenResp
             headers={"WWW-Authenticate": "Bearer"},
         )
     return TokenResponse(**_token_response(user, settings))
+
+
+@router.get("/me")
+def me(user: CurrentUser, db: DbSession, settings: SettingsDep) -> MeOut:
+    """Your account, and how much of your storage quota your images use. Uploads and
+    transformations that don't fit in `available_bytes` are refused with 403; deleting images
+    makes room."""
+    usage = Usage(storage_used(db, user.id), quota_limit(user.storage_quota_bytes, settings))
+    return MeOut(
+        **UserOut.model_validate(user).model_dump(),
+        storage=StorageOut(
+            used_bytes=usage.used_bytes,
+            limit_bytes=usage.limit_bytes,
+            available_bytes=usage.available_bytes,
+        ),
+    )

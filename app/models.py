@@ -4,6 +4,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -22,11 +23,17 @@ from app.db import Base
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("storage_quota_bytes >= -1", name="ck_users_storage_quota_bytes"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     username: Mapped[str] = mapped_column(String(50), unique=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Bytes of images this user may store: NULL means STORAGE_QUOTA_BYTES applies, -1 no limit
+    # (see app/quota.py).
+    storage_quota_bytes: Mapped[int | None] = mapped_column(BigInteger)
 
     images: Mapped[list["Image"]] = relationship(
         back_populates="owner", cascade="all, delete-orphan", passive_deletes=True
@@ -35,7 +42,11 @@ class User(Base):
 
 class Image(Base):
     __tablename__ = "images"
-    __table_args__ = (Index("ix_images_owner_id_created_at", "owner_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_images_owner_id_created_at", "owner_id", "created_at"),
+        # Lets a user's storage usage be summed from the index alone (app/quota.py).
+        Index("ix_images_owner_id_size", "owner_id", postgresql_include=["size_bytes"]),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))

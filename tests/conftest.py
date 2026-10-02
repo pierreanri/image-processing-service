@@ -24,6 +24,7 @@ os.environ.pop("TRANSFORM_RATE_LIMIT_PER_MINUTE", None)
 os.environ.pop("TRANSFORM_RATE_LIMIT_PER_HOUR", None)
 os.environ.pop("SHARE_MAX_TTL_SECONDS", None)
 os.environ.pop("SHARE_MAX_CONCURRENT_CONVERSIONS", None)
+os.environ.pop("STORAGE_QUOTA_BYTES", None)
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 

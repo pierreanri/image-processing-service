@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.imaging import apply_transformations, load_image
 from app.models import Image
+from app.quota import check_quota
 from app.schemas import TransformationSpec
 from app.storage import Storage, build_key
 
@@ -53,13 +54,20 @@ def release_connection(db: Session) -> None:
     db.commit()
 
 
-def persist_image(db: Session, storage: Storage, image: Image, data: bytes) -> None:
-    """Store an image's file, then its row."""
+def persist_image(
+    db: Session, storage: Storage, settings: Settings, image: Image, data: bytes
+) -> None:
+    """Store an image's file, then its row, within its owner's storage quota (raises
+    QuotaExceededError otherwise)."""
+    # Refuses what certainly doesn't fit before storing anything.
+    check_quota(db, settings, image.owner_id, image.size_bytes)
     release_connection(db)
     # File first: a crash in between leaves an orphaned file, never a row without its file.
     storage.save(image.storage_key, data, content_type=image.mime_type)
-    db.add(image)
     try:
+        # The check that decides: first in the transaction that inserts the row.
+        check_quota(db, settings, image.owner_id, image.size_bytes, lock=True)
+        db.add(image)
         db.commit()
     except Exception:
         db.rollback()

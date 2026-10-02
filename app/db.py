@@ -13,7 +13,10 @@ class Base(DeclarativeBase):
 
 @lru_cache
 def get_engine() -> Engine:
-    return create_engine(get_settings().database_url, pool_pre_ping=True)
+    # Storage quotas rely on READ COMMITTED (PostgreSQL's default): see app/quota.py.
+    return create_engine(
+        get_settings().database_url, pool_pre_ping=True, isolation_level="READ COMMITTED"
+    )
 
 
 @lru_cache

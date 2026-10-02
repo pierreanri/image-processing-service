@@ -6,8 +6,9 @@ whose worker died is taken over once `available_at` (the lease deadline) passes.
 carries a fresh token, and every change a worker makes to a job requires that token and an
 unexpired lease, so a worker whose lease ran out can neither finish nor fail the job (whether or
 not another worker has taken it over yet). Processing happens outside any transaction: the
-result file is saved first, then one transaction inserts the result image and marks the job
-succeeded, well within the orphan sweep's grace period (see app/sweep_orphans.py).
+result file is saved first, then one transaction checks the owner's storage quota, inserts the
+result image and marks the job succeeded, well within the orphan sweep's grace period (see
+app/sweep_orphans.py).
 """
 
 import logging
@@ -22,6 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import Settings
 from app.imaging import ImageProcessingError
 from app.models import Image, Job
+from app.quota import QuotaExceededError, check_quota
 from app.schemas import TransformationSpec
 from app.storage import Storage, StorageUnavailableError
 from app.transforms import discard_file, render_transformation
@@ -108,9 +110,15 @@ def run_job(
         return
 
     try:
+        with sessions() as db:
+            # An account that is already full can't take any result.
+            check_quota(db, settings, owner_id, None)
         image, data = render_transformation(storage, settings, source, spec, owner_id)
+        with sessions() as db:
+            # Refuses a result that certainly doesn't fit before storing it.
+            check_quota(db, settings, owner_id, image.size_bytes)
         storage.save(image.storage_key, data, content_type=image.mime_type)
-    except ImageProcessingError as exc:
+    except ImageProcessingError as exc:  # Including QuotaExceededError (403).
         fail(sessions, claim, exc.status_code, str(exc))
         return
     except StorageUnavailableError as exc:
@@ -123,16 +131,25 @@ def run_job(
         fail(sessions, claim, 404, SOURCE_GONE)
         return
 
-    if not _complete(sessions, claim, image):
+    if not _complete(sessions, settings, claim, image):
         discard_file(storage, image.storage_key)
 
 
-def _complete(sessions: sessionmaker[Session], claim: Claim, image: Image) -> bool:
-    """Insert the result image and mark the job succeeded, if this claim still holds it."""
+def _complete(
+    sessions: sessionmaker[Session], settings: Settings, claim: Claim, image: Image
+) -> bool:
+    """Insert the result image and mark the job succeeded, if it fits in its owner's storage
+    quota and this claim still holds the job."""
     with sessions() as db:
-        # The image first: its foreign keys lock the source image (and owner) before the job
-        # row, in the same order as deleting the source does (it then clears
-        # jobs.source_image_id), so the two can't deadlock.
+        # Locks the owner's users row first; then the image, whose foreign keys lock the source
+        # image, before the job row: the order in which deleting the source locks the image and
+        # then clears jobs.source_image_id, so the two can't deadlock.
+        try:
+            check_quota(db, settings, image.owner_id, image.size_bytes, lock=True)
+        except QuotaExceededError as exc:
+            db.rollback()
+            fail(sessions, claim, exc.status_code, str(exc))
+            return False
         db.add(image)
         try:
             db.flush()
@@ -229,7 +246,8 @@ def _update_claimed(claim: Claim):
             Job.id == claim.job_id,
             Job.claim_token == claim.token,
             Job.status == "running",
-            Job.available_at > func.now(),
+            # Not now(), which is when the transaction started: it may have waited for a lock.
+            Job.available_at > func.statement_timestamp(),
         )
         .execution_options(synchronize_session=False)
     )

@@ -296,8 +296,9 @@ def test_deleting_the_source_while_its_job_completes_does_not_deadlock(
     client, auth_headers, worker, storage
 ):
     """Completing a job and deleting its source lock the same two rows (the job and the source
-    image); they must do so in the same order. The source is deleted right after the worker's
-    first statement in the completing transaction, while that transaction is still open."""
+    image); they must do so in the same order. The source is deleted right after the first
+    statement of the completing transaction that comes after its storage quota check (which locks
+    the owner's row), while that transaction is still open."""
     job = queued(client, auth_headers)
     engine = get_sessionmaker().kw["bind"]
     worker_thread = threading.get_ident()
@@ -318,6 +319,8 @@ def test_deleting_the_source_while_its_job_completes_does_not_deadlock(
     def after_statement(conn, cursor, statement, parameters, context, executemany):
         if threading.get_ident() != worker_thread or not completing.is_set():
             return
+        if "FROM users" in statement or "sum(images.size_bytes)" in statement:
+            return  # The quota check.
         completing.clear()
         deleter.start()
         # Until the delete waits for a lock this transaction holds (or has finished).
@@ -646,18 +649,21 @@ def test_worker_loop_backs_off_on_database_errors_and_resets(worker, monkeypatch
     assert stop.waits == [2 * poll, 4 * poll, poll, 2 * poll, 4 * poll, 8 * poll, 16 * poll]
 
 
-def test_worker_waits_until_the_database_is_fully_migrated(worker):
+@pytest.mark.parametrize(
+    ("table", "column"), [("images", "share_generation"), ("users", "storage_quota_bytes")]
+)
+def test_worker_waits_until_the_database_is_fully_migrated(worker, table, column):
     """Not just until the jobs table exists: until every column the worker's code maps does."""
     engine = get_sessionmaker().kw["bind"]
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE images RENAME COLUMN share_generation TO not_yet"))
+        conn.execute(text(f"ALTER TABLE {table} RENAME COLUMN {column} TO not_yet"))
     try:
         stop = RecordingStop(waits=3)
         assert worker._wait_for_database(stop) is False
         assert len(stop.waits) == 3
     finally:
         with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE images RENAME COLUMN not_yet TO share_generation"))
+            conn.execute(text(f"ALTER TABLE {table} RENAME COLUMN not_yet TO {column}"))
 
     assert worker._wait_for_database(RecordingStop(waits=3)) is True
 

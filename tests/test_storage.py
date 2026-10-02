@@ -521,7 +521,12 @@ def test_downloads_are_closed_when_the_client_disconnects():
     assert len(body_messages) < 8
 
 
-def test_storage_calls_do_not_hold_a_database_connection(client, auth_headers, storage):
+@pytest.mark.parametrize(
+    ("operation", "method"), [("download", "open"), ("upload", "save"), ("transform", "read")]
+)
+def test_storage_calls_do_not_hold_a_database_connection(
+    client, auth_headers, storage, operation, method
+):
     """While storage is slow, other requests must still get a database connection: the pool is
     smaller than the threadpool."""
     image = upload(client, auth_headers).json()
@@ -539,18 +544,25 @@ def test_storage_calls_do_not_hold_a_database_connection(client, auth_headers, s
 
     app.dependency_overrides[get_db] = get_db_from_tiny_pool
     storage_called, release_storage = threading.Event(), threading.Event()
-    open_file = storage.open
+    real_call = getattr(storage, method)
 
-    def slow_open(key):
+    def slow_call(*args, **kwargs):
         storage_called.set()
         release_storage.wait(10)
-        return open_file(key)
+        return real_call(*args, **kwargs)
 
-    storage.open = slow_open
-    download = {}
-    thread = threading.Thread(
-        target=lambda: download.update(response=client.get(image["url"], headers=auth_headers))
-    )
+    setattr(storage, method, slow_call)
+    requests = {
+        "download": lambda: client.get(image["url"], headers=auth_headers),
+        "upload": lambda: upload(client, auth_headers),
+        "transform": lambda: client.post(
+            f"/images/{image['id']}/transform",
+            headers=auth_headers,
+            json={"transformations": {"flip": True}},
+        ),
+    }
+    slow = {}
+    thread = threading.Thread(target=lambda: slow.update(response=requests[operation]()))
     try:
         thread.start()
         assert storage_called.wait(10)
@@ -562,4 +574,4 @@ def test_storage_calls_do_not_hold_a_database_connection(client, auth_headers, s
         release_storage.set()
         thread.join(10)
         engine.dispose()
-    assert download["response"].status_code == 200
+    assert slow["response"].status_code in (200, 201)
