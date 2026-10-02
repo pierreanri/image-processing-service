@@ -33,6 +33,8 @@ optionally caches images converted on the fly and enforces per-user limits on tr
 - Long-lived `Cache-Control` headers (shorter for share links) and `ETag`/`If-None-Match` (304)
   support
 - Paginated image listing; users can only ever see their own images
+- Per-user storage quotas (1 GiB each by default): additions that don't fit are refused with
+  `403`, `GET /me` shows usage, and an operator command gives users limits of their own
 - A command that finds, and deletes, stored files no image refers to (left behind by crashes)
 - Interactive API docs at `/docs` (Swagger UI) and `/redoc`
 
@@ -101,6 +103,7 @@ Settings come from environment variables or a `.env` file.
 | `JOB_MAX_ATTEMPTS` | `3` | Runs of a job (retries after storage outages, takeovers) before it fails |
 | `JOB_RETENTION_DAYS` | `7` | Finished jobs are deleted after this many days |
 | `SHARE_MAX_TTL_SECONDS` | `2592000` (30 days) | Longest lifetime a share link may be given (at most a year); links last 1 day by default, or this if shorter |
+| `STORAGE_QUOTA_BYTES` | `1073741824` (1 GiB) | Bytes of images each user may store, unless they have a limit of their own (see [Storage quotas](#storage-quotas)); `0` means no limit |
 | `SHARE_MAX_CONCURRENT_CONVERSIONS` | `2` | Conversions that downloads through share links may run at once per API process; as many more wait up to 5 s, the rest get `503` |
 
 Options in the query string of `REDIS_URL` override the client settings; don't set
@@ -158,6 +161,32 @@ database is reachable and has every table and column it uses (the API container 
 migrations). On `SIGTERM` or `Ctrl-C` it finishes its current job, then
 exits. It also deletes finished jobs older than `JOB_RETENTION_DAYS`, at startup and hourly.
 
+### Storage quotas
+
+Each user may store `STORAGE_QUOTA_BYTES` of images (1 GiB by default; `0` turns quotas off), and
+`python -m app.quota` gives individual users a limit of their own:
+
+```bash
+python -m app.quota show                      # every user, by usage
+python -m app.quota show alice
+python -m app.quota set alice 5GB             # KB/MB/GB/TB = powers of 1000, KiB/MiB/GiB/TiB of 1024
+python -m app.quota set alice unlimited
+python -m app.quota set alice 0               # nothing more may be added
+python -m app.quota unset alice               # back to STORAGE_QUOTA_BYTES
+docker compose exec api python -m app.quota show
+```
+
+```
+alice (0b09df7a-d739-4557-9e1a-9780c9cd0455): using 274 bytes; limit 300 bytes (own limit); 26 bytes left
+```
+
+Users are named exactly as they registered; put `--` before a name that starts with `-`
+(`python -m app.quota set -- -bob 1GB`). An unknown user exits with `1`. Quotas apply as soon as a
+deployment is upgraded, so users already above their limit can't add images until they delete
+some or you raise their limit: run `python -m app.quota show` after upgrading. Usage is always
+exact, but during a rolling upgrade, API instances and workers still on the old version don't
+enforce quotas.
+
 ### Removing orphaned files
 
 A crash (or a storage error) at the wrong moment can leave a stored file that no image refers to;
@@ -214,13 +243,15 @@ ruff check . && ruff format --check .
 
 All `/images` and `/jobs` endpoints require an `Authorization: Bearer <token>` header; share
 links (`/shared/...`) need none, since the link itself is the credential. Requesting another
-user's image or job returns `404`, and too many transformations return `429` (see
-[Rate limits](#rate-limits)). Errors are returned as `{"detail": ...}`.
+user's image or job returns `404`, too many transformations return `429` (see
+[Rate limits](#rate-limits)), and images that don't fit in your storage quota `403` (see
+[Storage quota](#storage-quota)). Errors are returned as `{"detail": ...}`.
 
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/register` | Create an account; returns the user and an access token |
 | `POST` | `/login` | Exchange username and password for an access token |
+| `GET` | `/me` | Your account, and your storage usage and limit |
 | `POST` | `/images` | Upload an image (multipart field `file`) |
 | `GET` | `/images?page=1&limit=10` | List your images, newest first (`limit` ≤ 100) |
 | `GET` | `/images/{id}` | Get an image's metadata |
@@ -321,8 +352,8 @@ Unknown keys are rejected with `422`, so a typo never silently does nothing.
 By default a transformation runs within the request, which answers `201` with the new image. To
 run it in the background instead, send `Prefer: respond-async`
 ([RFC 7240](https://www.rfc-editor.org/rfc/rfc7240)): the request is checked as usual (a `401`,
-`404`, `422` for an invalid body, or `429` creates no job) and answers `202` with a job, whose
-`Location` to poll. A [worker](#background-worker) must be running to process it.
+`404`, `422` for an invalid body, `403` for a full account, or `429` creates no job) and answers
+`202` with a job, whose `Location` to poll. A [worker](#background-worker) must be running to process it.
 
 ```bash
 curl -i -X POST localhost:8000/images/$ID/transform \
@@ -353,11 +384,12 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8000/jobs/cf788b58-9f88-4db2-99
 
 `status` goes from `queued` to `running`, then `succeeded` (with the new image in `result`) or
 `failed` (with `error`: the `status_code` and `detail` the synchronous request would have answered,
-e.g. `422` for a crop outside the image, `404` if the source image was deleted meanwhile, or `503`
-if storage stayed unavailable through every retry). A job waiting to be retried after a storage
-outage is `queued` again, with that outage in `error`. While the job is unfinished, polling
-responses carry `Retry-After: 1`. If the new image has since been deleted, `result` is `null`. A job counts
-against the [rate limits](#rate-limits) when it is created, once.
+e.g. `422` for a crop outside the image, `404` if the source image was deleted meanwhile, `403` if
+the result doesn't fit in your storage quota by the time it is ready, or `503` if storage stayed
+unavailable through every retry). A job waiting to be retried after a storage outage is `queued`
+again, with that outage in `error`. While the job is unfinished, polling responses carry
+`Retry-After: 1`. If the new image has since been deleted, `result` is `null`. A job counts against
+the [rate limits](#rate-limits) when it is created, once; it reserves no storage.
 Finished jobs are kept for `JOB_RETENTION_DAYS` (7 by default), then `GET /jobs/{id}` answers `404`.
 The new image is an ordinary image, so it is still listed under `/images` after that.
 
@@ -366,9 +398,10 @@ The new image is an ordinary image, so it is still listed under `/images` after 
 Only `POST /images/{id}/transform` is limited, per user account: by default 30 transformations per
 minute and 500 per hour. A request counts once it passes authentication, request validation and the
 check that the image is yours, even if the transformation then fails (for example a `422` for a
-crop outside the image). Authentication failures (`401`), request-validation errors (`422` with a
-list of field errors), unknown or other users' images (`404`) and rejected requests (`429`) don't
-count.
+crop outside the image, or a `403` because the result doesn't fit in your storage quota).
+Authentication failures (`401`), request-validation errors (`422` with a list of field errors),
+unknown or other users' images (`404`), requests from accounts whose storage is already full
+(`403`) and rejected requests (`429`) don't count.
 
 Successful transformations carry the current state of each limit (field syntax from the IETF
 [RateLimit header fields draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)):
@@ -392,6 +425,39 @@ RateLimit: "minute";r=0;t=13, "hour";r=469;t=3000
 
 Clients should tolerate these headers being absent: they are only sent while the limits are
 enforced (Redis configured and reachable).
+
+### Storage quota
+
+Your images (uploads and transformation results) may take up to your storage quota: 1 GiB unless
+the operator set it otherwise. `GET /me` shows how much you use and have left:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" localhost:8000/me
+```
+
+```json
+{
+  "id": "0b09df7a-d739-4557-9e1a-9780c9cd0455",
+  "username": "alice",
+  "created_at": "2026-10-02T10:19:25.551124Z",
+  "storage": {"used_bytes": 274, "limit_bytes": 1073741824, "available_bytes": 1073741550}
+}
+```
+
+`limit_bytes` and `available_bytes` are `null` when you have no limit. An upload or transformation
+whose new image doesn't fit is refused with `403`, which retrying won't change; deleting images
+makes room:
+
+```
+HTTP/1.1 403 Forbidden
+
+{"detail": "Storage quota exceeded: 274 of your 300 bytes are used and this image takes 137; delete images to make room"}
+```
+
+A transformation is refused before it runs if your account is already full, and otherwise once
+its result's size is known. A background job fails with `403` if its result doesn't fit when it is
+ready. Everything else (listing, downloading, converting with `?format=`, share links, deleting)
+keeps working when you are at or over your limit.
 
 ### Share links
 
@@ -549,17 +615,31 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   an unexpired lease, so a worker that was merely slow can't finish (or fail) the job once its
   lease has run out: it deletes its result file instead, and each job produces at most one image.
   This also bounds how long after storing its file a job can commit the image, which the orphan
-  sweep relies on. A job claimed more than `JOB_MAX_ATTEMPTS` times
-  (its workers keep dying) fails with `500`, so a job that crashes its worker can't loop forever. Keep the lease well above the
-  slowest transformation.
-- **Job failures**: a transformation that doesn't fit the image fails at once, with the same status
-  and detail as the synchronous request. A storage outage puts the job back in the queue after
+  sweep relies on; the lease is compared with the time of the statement, not of its transaction's
+  start, which a lock wait can push back. A job claimed more than `JOB_MAX_ATTEMPTS` times (its
+  workers keep dying) fails with `500`, so a job that crashes its worker can't loop forever. Keep
+  the lease well above the slowest transformation.
+- **Job failures**: a transformation that doesn't fit the image, or whose result doesn't fit in the
+  owner's storage quota, fails at once, with the same status and detail as the synchronous
+  request. A storage outage puts the job back in the queue after
   10 s, then 20 s, 40 s, … until `JOB_MAX_ATTEMPTS` runs, then fails it with `503`. Anything
   unexpected is logged and fails the job with `500`. Database errors make the worker back off (up
   to 30 s) and retry; a job it was running then is run again once its lease has run out.
-- **Lock order**: completing a job inserts the result image (whose foreign key locks the source
-  image) before updating the job row, the same order in which deleting the source image locks
-  the image and then clears the job's `source_image_id`, so the two can't deadlock.
+- **Lock order**: a transaction that adds an image locks its owner's `users` row first (the quota
+  check), then the new image's source (through its foreign key), then, when completing a job, the
+  job row. Deleting an image locks the image, then clears `source_image_id` on the jobs that refer
+  to it: the same order, so completing a job and deleting its source can't deadlock. Deleting
+  takes no `users` lock, and a transaction waiting for one holds no other lock.
+- **Storage quotas** (`app/quota.py`): usage isn't stored but summed from `images.size_bytes`
+  (an index on `(owner_id) INCLUDE (size_bytes)` makes that an index-only scan), so it is exact
+  after crashes, failed deletes, restores and old instances. An unlocked check refuses what
+  certainly doesn't fit before anything is stored or rendered. The check that decides is the first
+  statement of the transaction that inserts the image: it locks the owner's row `FOR NO KEY
+  UPDATE` (which doesn't block foreign-key checks, so queuing jobs isn't held up), then sums in a
+  separate statement, whose snapshot under `READ COMMITTED` (pinned on the engine) includes every
+  image added by whoever held the lock before. One user's additions therefore take turns, each
+  holding the lock for milliseconds; a refused addition's stored file is deleted. A user's own
+  limit is `NULL` (the default applies), `-1` (no limit) or a number of bytes, `0` included.
 - **Share links** (`app/sharing.py`, `app/routers/shared.py`): a token is a 27-byte payload
   (version, image id, the image's share generation, expiry in Unix seconds, format code,
   quality) followed by the first 18 bytes of its HMAC-SHA256, base64url-encoded: 45 bytes are
@@ -589,5 +669,6 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
 
 ### Possible next steps
 
-Listing a user's jobs and notifying clients when a job finishes (webhooks), per-user storage
-quotas, and a limit on the conversions of authenticated downloads like the one for share links.
+Listing a user's jobs and notifying clients when a job finishes (webhooks), a limit on the
+conversions of authenticated downloads like the one for share links, and an admin API (roles) to
+replace the operator commands.
