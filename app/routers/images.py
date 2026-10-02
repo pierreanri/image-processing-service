@@ -1,13 +1,11 @@
 import math
 import re
 import uuid
-from email.utils import formatdate
 from typing import Annotated
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
-from starlette.types import Receive, Scope, Send
 
 from app.deps import (
     CurrentUser,
@@ -17,20 +15,14 @@ from app.deps import (
     TransformRateLimiterDep,
     VariantCacheDep,
 )
-from app.imaging import DEFAULT_QUALITY, FORMATS, apply_transformations, load_image
+from app.imaging import FORMATS, load_image
 from app.jobs import enqueue
 from app.models import Image, User
 from app.ratelimit import RateLimitDecision
+from app.routers.downloads import send_image
 from app.routers.views import image_out, job_out
-from app.schemas import (
-    ImageFormat,
-    ImageList,
-    ImageOut,
-    JobOut,
-    TransformationSpec,
-    TransformRequest,
-)
-from app.storage import FileStream, build_key
+from app.schemas import ImageFormat, ImageList, ImageOut, JobOut, TransformRequest
+from app.storage import build_key
 from app.transforms import discard_file, persist_image, release_connection, render_transformation
 
 router = APIRouter(prefix="/images", tags=["images"])
@@ -131,36 +123,17 @@ def get_image_content(
     Originals are streamed from storage; conversions are cached in Redis when it is configured.
     """
     image = _get_owned_image(db, user, image_id)
-    target_format = format or image.format
-    # Lossless formats ignore quality, so asking for one changes neither the bytes nor the ETag
-    # (and a lossless original is served as stored).
-    effective_quality = quality if target_format in DEFAULT_QUALITY else None
-    serve_original = effective_quality is None and target_format == image.format
-
-    # The variant token is both the ETag suffix and the cache field, so they can't drift apart.
-    variant = None if serve_original else f"{target_format}-q{effective_quality or 'default'}"
-    etag = f'"{image.id.hex}"' if variant is None else f'"{image.id.hex}-{variant}"'
-    headers = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
-    if _etag_matches(request.headers.get("if-none-match"), etag):
-        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
-    release_connection(db)
-
-    if variant is None:
-        headers["Last-Modified"] = formatdate(image.created_at.timestamp(), usegmt=True)
-        return _StoredFileResponse(
-            storage.open(image.storage_key), media_type=image.mime_type, headers=headers
-        )
-
-    data = cache.get(image.id, variant)
-    if data is None:
-        loaded = load_image(storage.read(image.storage_key), settings.max_image_pixels)
-        data = apply_transformations(
-            loaded,
-            TransformationSpec(format=target_format, quality=effective_quality),
-            settings.max_dimension,
-        ).data
-        cache.set(image.id, variant, data)
-    return Response(data, media_type=FORMATS[target_format].mime_type, headers=headers)
+    return send_image(
+        request,
+        image,
+        format,
+        quality,
+        headers={"Cache-Control": CACHE_CONTROL},
+        db=db,
+        storage=storage,
+        settings=settings,
+        cache=cache,
+    )
 
 
 @router.post(
@@ -290,32 +263,7 @@ def _get_owned_image(db: DbSession, user: User, image_id: uuid.UUID) -> Image:
     return image
 
 
-class _StoredFileResponse(StreamingResponse):
-    """Streams an open stored file with its Content-Length, and always closes it, even when the
-    client disconnects halfway (which releases the file or the S3 connection straight away)."""
-
-    def __init__(self, file: FileStream, *, media_type: str, headers: dict[str, str]) -> None:
-        super().__init__(
-            file, media_type=media_type, headers={**headers, "Content-Length": str(file.size)}
-        )
-        self._file = file
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            self._file.close()
-
-
 def _clean_filename(filename: str | None, extension: str) -> str:
     # Keep only the final path component; browsers on Windows may send full paths.
     name = re.split(r"[\\/]", filename or "")[-1].strip()
     return name[:255] or f"upload.{extension}"
-
-
-def _etag_matches(if_none_match: str | None, etag: str) -> bool:
-    if not if_none_match:
-        return False
-    if if_none_match.strip() == "*":
-        return True
-    return etag in (tag.strip().removeprefix("W/") for tag in if_none_match.split(","))

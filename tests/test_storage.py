@@ -19,7 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.main import app
-from app.routers.images import _StoredFileResponse
+from app.routers.downloads import _StoredFileResponse
 from app.storage import (
     CHUNK_SIZE,
     FileStream,
