@@ -9,14 +9,20 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings, get_settings
 from app.db import get_sessionmaker
+from app.imaging import apply_transformations, load_image
 from app.jobs import claim_next, run_job
 from app.main import app
 from app.models import Image, Job, User
 from app.quota import UNLIMITED, main, parse_size
+from app.schemas import TransformationSpec
 from tests.utils import make_image_bytes, register, share, stored_keys, user_id_of
 
 DATA = make_image_bytes()  # every upload in this module is this PNG
 SIZE = len(DATA)
+# The size of the image a background job in this module makes ({"flip": true} on DATA).
+FLIPPED_SIZE = len(
+    apply_transformations(load_image(DATA, 10**6), TransformationSpec(flip=True), 10**4).data
+)
 
 
 @pytest.fixture(params=["local", "s3"])
@@ -101,6 +107,32 @@ def test_uploads_are_refused_once_they_no_longer_fit(client, auth_headers, stora
     assert len(stored_keys(storage)) == 2
 
 
+def test_a_frozen_account_is_told_it_may_not_store_images(client, auth_headers, settings):
+    image = uploaded(client, auth_headers)
+    set_own_limit("alice", 0)
+
+    for response in (
+        upload(client, auth_headers),
+        transform(client, auth_headers, image["id"]),
+    ):
+        assert response.status_code == 403
+        assert response.json() == {
+            "detail": "Storage quota exceeded: this account may not store any images"
+        }
+
+
+def test_an_image_larger_than_the_whole_quota_is_told_so(client, auth_headers, settings):
+    settings.storage_quota_bytes = SIZE - 1
+
+    response = upload(client, auth_headers)
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": f"Storage quota exceeded: this image takes {SIZE} bytes, more than your whole "
+        f"quota of {SIZE - 1}"
+    }
+
+
 def test_deleting_images_makes_room(client, auth_headers, settings):
     settings.storage_quota_bytes = SIZE
     image = uploaded(client, auth_headers)
@@ -119,6 +151,15 @@ def test_a_default_of_zero_means_no_limit(client, auth_headers, settings):
 
     storage = client.get("/me", headers=auth_headers).json()["storage"]
     assert storage == {"used_bytes": 3 * SIZE, "limit_bytes": None, "available_bytes": None}
+
+
+def test_own_limits_apply_even_without_a_default_limit(client, auth_headers, settings):
+    settings.storage_quota_bytes = 0
+    set_own_limit("alice", SIZE)
+
+    statuses = [upload(client, auth_headers).status_code for _ in range(3)]
+
+    assert statuses == [201, 403, 403]
 
 
 def test_quotas_are_per_user(client, auth_headers, settings):
@@ -270,20 +311,24 @@ def test_a_job_whose_result_no_longer_fits_when_it_completes_fails(
 
     def save_then_fill_the_account(key, data, *, content_type):
         real_save(key, data, content_type=content_type)
-        set_own_limit("alice", SIZE)  # e.g. another upload took the rest meanwhile
+        # Room is left, but less than the result takes (e.g. another upload took the rest).
+        set_own_limit("alice", SIZE + 10)
 
     storage.save = save_then_fill_the_account
 
     worker.run_once()
 
-    assert job_error(client, auth_headers, job)["status_code"] == 403
+    assert job_error(client, auth_headers, job) == {
+        "status_code": 403,
+        "detail": full_detail(SIZE, SIZE + 10, FLIPPED_SIZE),
+    }
     assert len(stored_keys(storage)) == 1  # the result's file was discarded
     assert image_count() == 1
 
 
-def test_a_job_that_fits_succeeds(client, auth_headers, settings, worker):
+def test_a_job_that_fits_exactly_succeeds(client, auth_headers, settings, worker):
     job = queued_job(client, auth_headers)
-    settings.storage_quota_bytes = 3 * SIZE
+    settings.storage_quota_bytes = SIZE + FLIPPED_SIZE  # its result is counted once
     worker._settings = settings
 
     worker.run_once()
@@ -483,9 +528,15 @@ def test_bad_sizes_are_rejected(value):
         parse_size(value)
 
 
+def own_limit_of(username: str) -> int | None:
+    with get_sessionmaker()() as db:
+        return db.scalar(select(User.storage_quota_bytes).where(User.username == username))
+
+
 def test_set_unset_and_show(client, auth_headers, settings, capsys):
     uploaded(client, auth_headers)
     alice = user_id_of(auth_headers)
+    register(client, "bob")  # never changed, never shown
     default = get_settings().storage_quota_bytes
 
     assert main(["set", "alice", "5GB"]) == 0
@@ -511,6 +562,10 @@ def test_set_unset_and_show(client, auth_headers, settings, capsys):
     )
     assert upload(client, auth_headers).status_code == 201
 
+    assert main(["show", "alice"]) == 0
+    assert capsys.readouterr().out.count("\n") == 1
+    assert own_limit_of("bob") is None
+
 
 def test_show_lists_every_user_by_usage(client, auth_headers, capsys):
     bob = register(client, "bob")
@@ -528,9 +583,15 @@ def test_show_lists_every_user_by_usage(client, auth_headers, capsys):
 
 
 def test_unknown_users_are_an_error(client, capsys):
+    register(client, "bob")
+    set_own_limit("bob", 5)
+
     for command in (["show", "nobody"], ["set", "nobody", "1GB"], ["unset", "nobody"]):
         assert main(command) == 1
-        assert capsys.readouterr().err == "No user named 'nobody'\n"
+        captured = capsys.readouterr()
+        assert (captured.out, captured.err) == ("", "No user named 'nobody'\n")
+
+    assert own_limit_of("bob") == 5
 
 
 def test_usernames_starting_with_a_dash_need_a_double_dash(client, capsys):

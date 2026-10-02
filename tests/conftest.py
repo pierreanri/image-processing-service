@@ -19,12 +19,13 @@ for name in (
 ):
     os.environ.pop(name, None)
 os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
-# Test the default rate limits whatever the developer's environment says.
-os.environ.pop("TRANSFORM_RATE_LIMIT_PER_MINUTE", None)
-os.environ.pop("TRANSFORM_RATE_LIMIT_PER_HOUR", None)
-os.environ.pop("SHARE_MAX_TTL_SECONDS", None)
-os.environ.pop("SHARE_MAX_CONCURRENT_CONVERSIONS", None)
-os.environ.pop("STORAGE_QUOTA_BYTES", None)
+# Test these limits' defaults whatever the developer's environment says (set rather than removed,
+# or a value in their .env would apply).
+os.environ["TRANSFORM_RATE_LIMIT_PER_MINUTE"] = "30"
+os.environ["TRANSFORM_RATE_LIMIT_PER_HOUR"] = "500"
+os.environ["SHARE_MAX_TTL_SECONDS"] = str(30 * 24 * 60 * 60)
+os.environ["SHARE_MAX_CONCURRENT_CONVERSIONS"] = "2"
+os.environ["STORAGE_QUOTA_BYTES"] = str(1024**3)
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 

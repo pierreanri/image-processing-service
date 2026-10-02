@@ -163,8 +163,9 @@ exits. It also deletes finished jobs older than `JOB_RETENTION_DAYS`, at startup
 
 ### Storage quotas
 
-Each user may store `STORAGE_QUOTA_BYTES` of images (1 GiB by default; `0` turns quotas off), and
-`python -m app.quota` gives individual users a limit of their own:
+Each user may store `STORAGE_QUOTA_BYTES` of images (1 GiB by default; `0` means no default limit),
+and `python -m app.quota` gives individual users a limit of their own, which they keep whatever the
+default (`unset` removes it):
 
 ```bash
 python -m app.quota show                      # every user, by usage
@@ -446,7 +447,7 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8000/me
 
 `limit_bytes` and `available_bytes` are `null` when you have no limit. An upload or transformation
 whose new image doesn't fit is refused with `403`, which retrying won't change; deleting images
-makes room:
+makes room, unless the new image is larger than your whole quota (the detail then says so):
 
 ```
 HTTP/1.1 403 Forbidden

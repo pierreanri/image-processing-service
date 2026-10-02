@@ -56,7 +56,7 @@ def login(body: LoginRequest, db: DbSession, settings: SettingsDep) -> TokenResp
 def me(user: CurrentUser, db: DbSession, settings: SettingsDep) -> MeOut:
     """Your account, and how much of your storage quota your images use. Uploads and
     transformations that don't fit in `available_bytes` are refused with 403; deleting images
-    makes room."""
+    makes room, unless the new image is larger than `limit_bytes`."""
     usage = Usage(storage_used(db, user.id), quota_limit(user.storage_quota_bytes, settings))
     return MeOut(
         **UserOut.model_validate(user).model_dump(),

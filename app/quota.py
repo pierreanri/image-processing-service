@@ -99,6 +99,14 @@ def check_quota(
     used = storage_used(db, owner_id)
     if used + (1 if size is None else size) <= limit:
         return
+    # Only advise deleting images when that can make room.
+    if limit == 0:
+        raise QuotaExceededError("Storage quota exceeded: this account may not store any images")
+    if size is not None and size > limit:
+        raise QuotaExceededError(
+            f"Storage quota exceeded: this image takes {size} bytes, more than your whole quota "
+            f"of {limit}"
+        )
     if size is None:
         raise QuotaExceededError(
             f"Storage quota exceeded: you are using {used} of your {limit} bytes; delete images "
