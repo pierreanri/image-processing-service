@@ -20,6 +20,13 @@ def user_id_of(headers: dict) -> uuid.UUID:
     return uuid.UUID(jwt.decode(token, options={"verify_signature": False})["sub"])
 
 
+def share(client: TestClient, headers: dict, image_id: str, **body) -> dict:
+    """Create a share link to an image (POST /images/{id}/share-links) and return it."""
+    response = client.post(f"/images/{image_id}/share-links", headers=headers, json=body or None)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def stored_keys(storage) -> list[str]:
     """Every key in a LocalStorage or S3Storage (temporary files included), sorted."""
     if isinstance(storage, LocalStorage):

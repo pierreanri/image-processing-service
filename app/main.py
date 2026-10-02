@@ -9,7 +9,14 @@ from app.cache import get_variant_cache
 from app.config import get_settings
 from app.imaging import ImageProcessingError
 from app.ratelimit import get_transform_rate_limiter
-from app.routers import auth, images, jobs
+from app.routers import auth, images, jobs, shared
+from app.sharing import (
+    ACCESS_LOG_FILTER,
+    ConversionsBusyError,
+    get_share_conversion_slots,
+    get_share_signer,
+    redact_share_tokens,
+)
 from app.storage import StorageUnavailableError, get_storage
 
 logger = logging.getLogger(__name__)
@@ -24,6 +31,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     get_storage()
     get_variant_cache()
     get_transform_rate_limiter()
+    get_share_signer()
+    get_share_conversion_slots()
+    # Share links are credentials, and uvicorn logs every request's path (adding the filter
+    # again, e.g. on a second startup in tests, does nothing).
+    logging.getLogger("uvicorn.access").addFilter(ACCESS_LOG_FILTER)
     yield
 
 
@@ -37,6 +49,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(images.router)
     app.include_router(jobs.router)
+    app.include_router(shared.router)
 
     @app.exception_handler(ImageProcessingError)
     async def image_processing_error(request: Request, exc: ImageProcessingError) -> JSONResponse:
@@ -44,10 +57,22 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(StorageUnavailableError)
     async def storage_unavailable(request: Request, exc: StorageUnavailableError) -> JSONResponse:
-        logger.warning(
-            "Image storage unavailable (%s %s): %s", request.method, request.url.path, exc
-        )
+        path = redact_share_tokens(request.url.path)
+        logger.warning("Image storage unavailable (%s %s): %s", request.method, path, exc)
         return JSONResponse({"detail": "Image storage is temporarily unavailable"}, status_code=503)
+
+    @app.exception_handler(ConversionsBusyError)
+    async def conversions_busy(request: Request, exc: ConversionsBusyError) -> JSONResponse:
+        # Only downloads through share links are limited, and those may come from any page.
+        return JSONResponse(
+            {"detail": "Too many conversions in progress; retry shortly"},
+            status_code=503,
+            headers={
+                "Retry-After": "5",
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
 
     @app.get("/health", tags=["health"])
     def health() -> dict[str, str]:

@@ -646,6 +646,22 @@ def test_worker_loop_backs_off_on_database_errors_and_resets(worker, monkeypatch
     assert stop.waits == [2 * poll, 4 * poll, poll, 2 * poll, 4 * poll, 8 * poll, 16 * poll]
 
 
+def test_worker_waits_until_the_database_is_fully_migrated(worker):
+    """Not just until the jobs table exists: until every column the worker's code maps does."""
+    engine = get_sessionmaker().kw["bind"]
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE images RENAME COLUMN share_generation TO not_yet"))
+    try:
+        stop = RecordingStop(waits=3)
+        assert worker._wait_for_database(stop) is False
+        assert len(stop.waits) == 3
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE images RENAME COLUMN not_yet TO share_generation"))
+
+    assert worker._wait_for_database(RecordingStop(waits=3)) is True
+
+
 def test_worker_loop_backoff_stays_capped_through_a_long_outage(worker, monkeypatch):
     def run_once():
         raise OperationalError("SELECT 1", {}, Exception("database went away"))

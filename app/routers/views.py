@@ -1,9 +1,13 @@
 """Response bodies shared by the image and job routers."""
 
+from datetime import UTC, datetime
+
 from fastapi import Request
 
+from app.imaging import FORMATS
 from app.models import Image, Job
-from app.schemas import ImageOut, JobError, JobOut
+from app.schemas import ImageOut, JobError, JobOut, ShareLinkOut
+from app.sharing import ShareLink
 
 
 def image_out(image: Image, request: Request) -> ImageOut:
@@ -38,4 +42,16 @@ def job_out(job: Job, request: Request, result: Image | None) -> JobOut:
         finished_at=job.finished_at,
         result=image_out(result, request) if result is not None else None,
         error=error,
+    )
+
+
+def share_link_out(link: ShareLink, token: str, request: Request) -> ShareLinkOut:
+    info = FORMATS[link.format]
+    return ShareLinkOut(
+        url=str(request.url_for("get_shared_image", token=token, ext=info.extension)),
+        image_id=link.image_id,
+        format=link.format,
+        mime_type=info.mime_type,
+        quality=link.quality,
+        expires_at=datetime.fromtimestamp(link.expires, UTC),
     )

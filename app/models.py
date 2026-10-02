@@ -54,6 +54,9 @@ class Image(Base):
         JSON().with_variant(JSONB(), "postgresql")
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Incremented by DELETE /images/{id}/share-links: share links carry the value they were
+    # issued with, and stop working once it changes (see app/sharing.py).
+    share_generation: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     owner: Mapped[User] = relationship(back_populates="images")
 

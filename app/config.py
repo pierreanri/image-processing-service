@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     # Finished jobs are deleted after this many days.
     job_retention_days: int = Field(default=7, gt=0)
 
+    # Share links (POST /images/{id}/share-links). The longest lifetime a link may be given; links
+    # last 1 day by default (or this, if shorter). They are signed with a key derived from
+    # JWT_SECRET, so changing it ends every link.
+    share_max_ttl_seconds: int = Field(default=30 * 24 * 60 * 60, gt=0, le=365 * 24 * 60 * 60)
+    # Conversions (format/quality) that downloads through share links may run at once in each
+    # API process; as many more wait up to 5 s for a slot, the rest get 503.
+    share_max_concurrent_conversions: int = Field(default=2, gt=0)
+
 
 @lru_cache
 def get_settings() -> Settings:

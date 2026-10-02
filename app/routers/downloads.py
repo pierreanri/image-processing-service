@@ -1,4 +1,5 @@
-"""Sending an image's bytes, as stored or converted, for the download endpoints."""
+"""Sending an image's bytes, as stored or converted: shared by GET /images/{id}/content and
+GET /shared/{token}.{ext} (share links)."""
 
 from email.utils import formatdate
 
@@ -12,6 +13,7 @@ from app.config import Settings
 from app.imaging import DEFAULT_QUALITY, FORMATS, apply_transformations, load_image
 from app.models import Image
 from app.schemas import TransformationSpec
+from app.sharing import ConversionSlots
 from app.storage import FileStream, Storage
 from app.transforms import release_connection
 
@@ -43,13 +45,16 @@ def send_image(
     storage: Storage,
     settings: Settings,
     cache: VariantCache,
+    conversion_slots: ConversionSlots | None = None,
 ) -> Response:
     """Answer a download of `image`, which the caller has authorized: 304 when If-None-Match
     matches, else the stored file streamed, or its conversion to `format`/`quality` from the
-    cache or made now. `headers` go on every response."""
+    cache or made now (in one of `conversion_slots`, if given). `headers` go on every
+    response."""
     target_format, effective_quality, variant = image_variant(image.format, format, quality)
     etag = f'"{image.id.hex}"' if variant is None else f'"{image.id.hex}-{variant}"'
-    headers = {**headers, "ETag": etag}
+    # The type always comes from the format detected on upload; browsers must not guess another.
+    headers = {**headers, "ETag": etag, "X-Content-Type-Options": "nosniff"}
     if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     release_connection(db)
@@ -61,8 +66,16 @@ def send_image(
         )
 
     data = cache.get(image.id, variant)
-    if data is None:
+    if data is None and conversion_slots is None:
         data = _convert(image, target_format, effective_quality, variant, storage, settings, cache)
+    elif data is None:
+        with conversion_slots.hold():
+            # A request this one waited for may have just cached the same variant.
+            data = cache.get(image.id, variant)
+            if data is None:
+                data = _convert(
+                    image, target_format, effective_quality, variant, storage, settings, cache
+                )
     return Response(data, media_type=FORMATS[target_format].mime_type, headers=headers)
 
 

@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import Settings, get_settings
 from app.db import get_sessionmaker
 from app.jobs import claim_next, fail, prune_finished, run_job
-from app.models import Job
+from app.models import Image, Job
 from app.storage import Storage, get_storage
 
 logger = logging.getLogger(__name__)
@@ -97,12 +97,15 @@ class Worker:
         while not stop.is_set():
             try:
                 with self._sessions() as db:
-                    db.execute(select(Job.id).limit(1))
+                    # Every column of the tables jobs use, so a new worker doesn't start before
+                    # the migrations that came with it have run.
+                    db.execute(select(Job).limit(1))
+                    db.execute(select(Image).limit(1))
                 return True
             except SQLAlchemyError as exc:
                 if not logged:
                     logger.info(
-                        "Waiting for the database and its jobs table (%s)", exc.__class__.__name__
+                        "Waiting for the database to be migrated (%s)", exc.__class__.__name__
                     )
                     logged = True
                 stop.wait(self._settings.job_poll_seconds)

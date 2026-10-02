@@ -2,7 +2,14 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 
 
 class RegisterRequest(BaseModel):
@@ -152,6 +159,38 @@ class ImageList(BaseModel):
     limit: int
     total: int
     pages: int
+
+
+class ShareLinkRequest(StrictModel):
+    format: ImageFormat | None = Field(
+        default=None, description="Serve the image converted to this format."
+    )
+    quality: int | None = Field(default=None, ge=1, le=100, description="JPEG/WebP quality.")
+    expires_in: int | None = Field(
+        default=None, gt=0, description="Lifetime in seconds (default: 1 day)."
+    )
+    expires_at: AwareDatetime | None = Field(
+        default=None,
+        description="When the link stops working, instead of `expires_in`. The same image, "
+        "variant and expiry always give the same URL.",
+    )
+
+    @model_validator(mode="after")
+    def _one_expiry(self) -> "ShareLinkRequest":
+        if self.expires_in is not None and self.expires_at is not None:
+            raise ValueError("give expires_in or expires_at, not both")
+        return self
+
+
+class ShareLinkOut(BaseModel):
+    url: str = Field(
+        description="Downloads the image without a token until the link expires or is revoked."
+    )
+    image_id: uuid.UUID
+    format: str
+    mime_type: str
+    quality: int | None = Field(description="null: the format's default, or a lossless format.")
+    expires_at: datetime
 
 
 class JobError(BaseModel):

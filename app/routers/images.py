@@ -5,12 +5,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.deps import (
     CurrentUser,
     DbSession,
     SettingsDep,
+    ShareSignerDep,
     StorageDep,
     TransformRateLimiterDep,
     VariantCacheDep,
@@ -19,16 +20,26 @@ from app.imaging import FORMATS, load_image
 from app.jobs import enqueue
 from app.models import Image, User
 from app.ratelimit import RateLimitDecision
-from app.routers.downloads import send_image
-from app.routers.views import image_out, job_out
-from app.schemas import ImageFormat, ImageList, ImageOut, JobOut, TransformRequest
+from app.routers.downloads import image_variant, send_image
+from app.routers.views import image_out, job_out, share_link_out
+from app.schemas import (
+    ImageFormat,
+    ImageList,
+    ImageOut,
+    JobOut,
+    ShareLinkOut,
+    ShareLinkRequest,
+    TransformRequest,
+)
+from app.sharing import DEFAULT_LIFETIME_SECONDS, ShareLink
 from app.storage import build_key
 from app.transforms import discard_file, persist_image, release_connection, render_transformation
 
 router = APIRouter(prefix="/images", tags=["images"])
 
 # Stored images never change (a transformation creates a new image), so clients may cache
-# downloads for a long time; ETags are derived from the image id.
+# downloads for a long time; ETags are derived from the image id. Downloads through share links
+# are cached for less long, since links can be revoked (app/routers/shared.py).
 CACHE_CONTROL = "private, max-age=31536000, immutable"
 
 
@@ -209,6 +220,59 @@ def transform_image(
     return image_out(image, request)
 
 
+@router.post("/{image_id}/share-links")
+def create_share_link(
+    image_id: uuid.UUID,
+    request: Request,
+    response: Response,
+    user: CurrentUser,
+    db: DbSession,
+    settings: SettingsDep,
+    signer: ShareSignerDep,
+    body: ShareLinkRequest | None = None,
+) -> ShareLinkOut:
+    """Create a link that downloads the image without a token (to embed in an `<img>`, or to
+    send to someone), optionally converted with `format` and `quality`.
+
+    The link is the credential: anyone holding it can download the image until it expires (in 1
+    day by default, at most SHARE_MAX_TTL_SECONDS) or DELETE /images/{id}/share-links revokes it.
+    Nothing is stored, and the same image, variant and expiry always give the same URL.
+    """
+    body = body or ShareLinkRequest()
+    expires = _share_link_expiry(body, signer.now(), settings.share_max_ttl_seconds)
+    image = _get_owned_image(db, user, image_id)
+    target_format, quality, variant = image_variant(image.format, body.format, body.quality)
+    # Every download through such a link would fail (see load_image and apply_transformations).
+    too_large = (
+        max(image.width, image.height) > settings.max_dimension
+        or image.width * image.height > settings.max_image_pixels
+    )
+    if variant is not None and too_large:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"Image {image.width}x{image.height} is too large to convert; share it without "
+            "format or quality",
+        )
+    link = ShareLink(image.id, image.share_generation, expires, target_format, quality)
+    # The body is a credential.
+    response.headers["Cache-Control"] = "no-store"
+    return share_link_out(link, signer.sign(link), request)
+
+
+@router.delete("/{image_id}/share-links", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_share_links(image_id: uuid.UUID, user: CurrentUser, db: DbSession) -> None:
+    """Revoke every share link to the image created so far; links created afterwards work."""
+    image = _get_owned_image(db, user, image_id)
+    # In SQL, so that concurrent revocations all count.
+    db.execute(
+        update(Image)
+        .where(Image.id == image.id)
+        .values(share_generation=Image.share_generation + 1)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+
+
 @router.delete("/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_image(
     image_id: uuid.UUID,
@@ -253,6 +317,25 @@ def _too_many_transformations(decision: RateLimitDecision) -> HTTPException:
         f"Too many transformations (limit: {limits}); retry in {decision.retry_after_seconds}s",
         headers=decision.headers(),
     )
+
+
+def _share_link_expiry(body: ShareLinkRequest, now: float, max_ttl: int) -> int:
+    """When a link asked for at `now` expires, in Unix seconds; refuses (rather than shortens)
+    a lifetime over `max_ttl`."""
+    if body.expires_at is not None:
+        expires = math.floor(body.expires_at.timestamp())
+        if not now < expires <= now + max_ttl:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"expires_at must be in the future and at most {max_ttl} seconds away",
+            )
+        return expires
+    lifetime = body.expires_in or min(DEFAULT_LIFETIME_SECONDS, max_ttl)
+    if lifetime > max_ttl:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, f"expires_in may be at most {max_ttl} seconds"
+        )
+    return math.floor(now) + lifetime
 
 
 def _get_owned_image(db: DbSession, user: User, image_id: uuid.UUID) -> Image:

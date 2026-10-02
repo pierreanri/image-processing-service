@@ -160,7 +160,8 @@ def test_content_returns_original_bytes(client, auth_headers):
     assert response.headers["content-length"] == str(len(data))
     assert "transfer-encoding" not in response.headers
     assert response.headers["etag"] == f'"{uuid.UUID(image["id"]).hex}"'
-    assert "max-age" in response.headers["cache-control"]
+    assert response.headers["cache-control"] == "private, max-age=31536000, immutable"
+    assert response.headers["x-content-type-options"] == "nosniff"
     last_modified = parsedate_to_datetime(response.headers["last-modified"])
     created_at = datetime.fromisoformat(image["created_at"])
     assert abs((last_modified - created_at).total_seconds()) < 1
