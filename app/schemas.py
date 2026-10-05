@@ -212,10 +212,13 @@ class JobError(BaseModel):
     detail: str
 
 
+JobStatus = Literal["queued", "running", "succeeded", "failed"]
+
+
 class JobOut(BaseModel):
     id: uuid.UUID
     url: str = Field(description="Where to poll this job.")
-    status: Literal["queued", "running", "succeeded", "failed"]
+    status: JobStatus
     source_image_id: uuid.UUID | None = Field(
         description="The image being transformed (null once it has been deleted)."
     )
@@ -229,4 +232,11 @@ class JobOut(BaseModel):
     )
     error: JobError | None = Field(
         description="Why the job failed, or the last error of a job waiting to be retried."
+    )
+
+
+class JobList(BaseModel):
+    items: list[JobOut]
+    next_cursor: str | None = Field(
+        description="Pass as `cursor` to get the next page; null on the last page."
     )
