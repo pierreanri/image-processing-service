@@ -7,6 +7,7 @@ format, filters) and download images in different formats.
 Built with **FastAPI**, **Pillow**, **SQLAlchemy 2** and **PostgreSQL**. Files are stored on the
 local disk or in any **S3-compatible** bucket (AWS S3, Cloudflare R2, SeaweedFS, …); **Redis**
 optionally caches images converted on the fly and enforces per-user limits on transformations.
+Background transformations can notify a **webhook** when they finish.
 
 ## Features
 
@@ -19,6 +20,11 @@ optionally caches images converted on the fly and enforces per-user limits on tr
 - Transformations run in the request, or in the background on request (`Prefer: respond-async`):
   the API answers `202` with a job to poll, and worker processes run it, with retries and
   takeover of jobs whose worker died
+- Job listing, newest first, filtered by status, with cursor paging
+- Webhooks: one URL per account receives an event, signed as
+  [Standard Webhooks](https://www.standardwebhooks.com/) specifies, each time a background job
+  finishes; failed deliveries are retried for a day, and jobs show how theirs is going. Only public
+  `https://` hosts are contacted, checked when connecting
 - Image files on local disk (default) or in an S3-compatible bucket; downloads always stream
   through the API, with the same authentication, caching headers and conversions on both
 - Download images as stored, or converted on the fly with `?format=` and `?quality=`
@@ -81,7 +87,7 @@ Settings come from environment variables or a `.env` file.
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `postgresql+psycopg://imgsvc:imgsvc@localhost:5432/imgsvc` | SQLAlchemy database URL |
-| `JWT_SECRET` | *(required)* | Secret used to sign tokens and share links, at least 32 characters; changing it logs everyone out and ends every share link |
+| `JWT_SECRET` | *(required)* | Secret used to sign tokens and share links and to derive webhook secrets, at least 32 characters; changing it logs everyone out, ends every share link and changes every webhook signing secret |
 | `JWT_EXPIRE_MINUTES` | `60` | Access token lifetime |
 | `STORAGE_BACKEND` | `local` | Where image files are stored: `local` or `s3` |
 | `STORAGE_DIR` | `./storage` | Directory for image files (local backend) |
@@ -105,11 +111,19 @@ Settings come from environment variables or a `.env` file.
 | `SHARE_MAX_TTL_SECONDS` | `2592000` (30 days) | Longest lifetime a share link may be given (at most a year); links last 1 day by default, or this if shorter |
 | `STORAGE_QUOTA_BYTES` | `1073741824` (1 GiB) | Bytes of images each user may store, unless they have a limit of their own (see [Storage quotas](#storage-quotas)); `0` means no limit |
 | `SHARE_MAX_CONCURRENT_CONVERSIONS` | `2` | Conversions that downloads through share links may run at once per API process; as many more wait up to 5 s, the rest get `503` |
+| `PUBLIC_BASE_URL` | *(empty: webhooks off)* | The URL clients reach the API at, such as `https://api.example.com` (a path prefix is kept): webhook payloads link to jobs and images under it. While it is empty, `PUT /me/webhook` answers `503` and workers send no webhooks |
+| `WEBHOOK_SENDERS` | `4` | Threads in each worker that send webhook events (at most 8); `0`: this worker sends none |
+| `WEBHOOK_TIMEOUT_SECONDS` | `10` | How long one delivery attempt may take in all, from resolving the host to receiving the response's headers (at most 30) |
+| `WEBHOOK_ALLOW_PRIVATE_NETWORKS` | `false` | Development only: also allow `http://` URLs and hosts on private, loopback and similar networks (cloud metadata addresses stay refused). Never set it where users aren't trusted: it lets them reach internal services through the workers |
 
 Options in the query string of `REDIS_URL` override the client settings; don't set
 `decode_responses` there (the app refuses to start if you do). An unsupported scheme, a bad port,
 or an unknown or invalid option in `REDIS_URL` also stops startup, but an unreachable Redis does
 not.
+
+An invalid `PUBLIC_BASE_URL` (it must be `http(s)://host[:port][/path]`, without a query or a
+fragment) stops startup; the API logs a warning while it is empty. Set it to the URL clients use:
+only its syntax can be checked, and payloads would carry wrong links.
 
 For S3, a missing `S3_BUCKET`, an invalid `S3_ENDPOINT_URL` (it must be `http(s)://host[:port]`),
 only one of the two keys, or no keys and nothing found by boto3's default credential chain stops
@@ -160,6 +174,16 @@ worker needs the same settings as the API (database, storage) and waits at start
 database is reachable and has every table and column it uses (the API container runs the
 migrations). On `SIGTERM` or `Ctrl-C` it finishes its current job, then
 exits. It also deletes finished jobs older than `JOB_RETENTION_DAYS`, at startup and hourly.
+
+Workers also send [webhook](#webhooks) events, from `WEBHOOK_SENDERS` threads beside the one that
+runs jobs, so a slow or hanging webhook never delays a job (they need `PUBLIC_BASE_URL`; the
+worker logs why it sends none otherwise). On `SIGTERM` each sender also finishes its current
+attempt, which takes at most `WEBHOOK_TIMEOUT_SECONDS`. Senders make HTTPS requests to URLs your
+users choose, so give workers internet access, preferably through an egress firewall that blocks
+your internal networks (the address checks described under [Webhooks](#webhooks) are a second
+layer), and from an IP address that no third party allowlists. A resolver with short timeouts
+(`options timeout:1 attempts:2` in `/etc/resolv.conf`) keeps a slow name server from holding a
+sender for long; a sender that is stuck that way is replaced after its 2-minute lease.
 
 ### Storage quotas
 
@@ -242,7 +266,7 @@ ruff check . && ruff format --check .
 
 ## API
 
-All `/images` and `/jobs` endpoints require an `Authorization: Bearer <token>` header; share
+All `/me`, `/images` and `/jobs` endpoints require an `Authorization: Bearer <token>` header; share
 links (`/shared/...`) need none, since the link itself is the credential. Requesting another
 user's image or job returns `404`, too many transformations return `429` (see
 [Rate limits](#rate-limits)), and images that don't fit in your storage quota `403` (see
@@ -258,7 +282,12 @@ user's image or job returns `404`, too many transformations return `429` (see
 | `GET` | `/images/{id}` | Get an image's metadata |
 | `GET` | `/images/{id}/content` | Download the image; optional `format` and `quality` query params (always the whole image: no `Range` or `HEAD`) |
 | `POST` | `/images/{id}/transform` | Transform an image into a new image (or, with `Prefer: respond-async`, start a job that does) |
+| `GET` | `/jobs?status=&limit=10&cursor=` | List your background transformations, newest first (see [Listing jobs](#listing-jobs)) |
 | `GET` | `/jobs/{id}` | Get a background transformation's status and, once done, its image |
+| `PUT` | `/me/webhook` | Set the URL that events about your jobs are sent to (see [Webhooks](#webhooks)) |
+| `GET` | `/me/webhook` | Your webhook, and how deliveries to it are going |
+| `DELETE` | `/me/webhook` | Remove your webhook; events not yet delivered are canceled |
+| `POST` | `/me/webhook/secret` | Issue a new signing secret for your webhook |
 | `POST` | `/images/{id}/share-links` | Create a share link: a URL that downloads the image without a token (see [Share links](#share-links)) |
 | `DELETE` | `/images/{id}/share-links` | Revoke every share link to the image created so far |
 | `GET` | `/shared/{token}.{ext}` | Download an image through a share link (no `Authorization` header) |
@@ -379,7 +408,8 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8000/jobs/cf788b58-9f88-4db2-99
   "started_at": "2026-09-30T13:57:37.756847Z",
   "finished_at": "2026-09-30T13:57:37.843719Z",
   "result": {"id": "502a037b-a7a5-4ed3-88fd-cc6d50b38358", "url": "http://localhost:8000/images/502a037b-a7a5-4ed3-88fd-cc6d50b38358/content", "...": "..."},
-  "error": null
+  "error": null,
+  "webhook": null
 }
 ```
 
@@ -393,6 +423,199 @@ again, with that outage in `error`. While the job is unfinished, polling respons
 the [rate limits](#rate-limits) when it is created, once; it reserves no storage.
 Finished jobs are kept for `JOB_RETENTION_DAYS` (7 by default), then `GET /jobs/{id}` answers `404`.
 The new image is an ordinary image, so it is still listed under `/images` after that.
+Instead of polling, you can have finished jobs reported to a [webhook](#webhooks); `webhook` then
+shows how its event's delivery is going.
+
+### Listing jobs
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" "localhost:8000/jobs?status=queued&status=running&limit=20"
+# => {"items": [...], "next_cursor": "MjAyNi0xMC0wNVQxMjowMDowMC4xMjM0NTYrMDA6MDAsY2Y3ODhiNTgtOWY4OC00ZGIyLTk5YjYtNTQ0NzhmYzE5MThj"}
+curl -H "Authorization: Bearer $TOKEN" "localhost:8000/jobs?status=queued&status=running&limit=20&cursor=MjAy..."
+```
+
+`GET /jobs` lists your jobs newest (most recently submitted) first, each as `GET /jobs/{id}`
+describes it. `status` (repeat it for several) keeps only jobs in those states, and `limit` is 1 to
+100 (10 by default). Unlike `/images`, pages are anchored to the last job of the previous page:
+pass its `next_cursor` as `cursor`, with the same filters, until it is `null`. Jobs submitted while
+you page through don't shift or repeat what you see, and there is no total. A malformed cursor is
+a `422`. Jobs are deleted `JOB_RETENTION_DAYS` after they finish.
+
+### Webhooks
+
+Instead of polling jobs, set a webhook: each time one of your background transformations
+finishes, the service POSTs an event to it.
+
+```bash
+curl -X PUT localhost:8000/me/webhook \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"url": "https://hooks.example.com/imgsvc"}'
+```
+
+```json
+{
+  "url": "https://hooks.example.com/imgsvc",
+  "created_at": "2026-10-05T12:00:00.123456Z",
+  "updated_at": "2026-10-05T12:00:00.123456Z",
+  "secret_created_at": "2026-10-05T12:00:00.123456Z",
+  "previous_secret_expires_at": null,
+  "pending_deliveries": 0,
+  "consecutive_failures": 0,
+  "paused_until": null,
+  "secret": "whsec_lr3mCHN2n0g+1iT5AlXmSwH6+iZzHT5L4n0B3Y0P6Xc="
+}
+```
+
+- The first `PUT` answers `201` with the signing `secret`, shown only this once: keep it
+  (`POST /me/webhook/secret` issues a new one). Each account has one webhook: a `PUT` with another
+  URL changes it (`200`, same secret), and events not yet delivered go to the new URL; the same URL
+  again changes nothing. `GET /me/webhook` shows it and how deliveries are going (never the
+  secret); `DELETE /me/webhook` removes it and cancels the events not yet delivered.
+- URLs must be `https://` with a public host. Refused with `422`: user names or passwords in the
+  URL, fragments, `localhost` and names under `.localhost`, `.local`, `.internal` and
+  `.home.arpa`, single-label names, numeric spellings of IPv4 addresses (`2130706433`, `127.1`),
+  and private, loopback, link-local and other non-public addresses. International names must be in
+  their `xn--` form. Nothing is sent when you set it, and the host isn't looked up then: its
+  addresses are checked whenever an event is sent, and a host with any non-public address is never
+  contacted. Redirects aren't followed.
+- Webhooks need `PUBLIC_BASE_URL` on the server (`PUT` answers `503` without it).
+
+#### Events
+
+```
+POST /imgsvc HTTP/1.1
+Host: hooks.example.com
+Content-Type: application/json
+User-Agent: imgsvc-webhooks/1
+webhook-id: 0b7a1d6e-3c2f-4f7e-9a51-2f4c9c1e8d10
+webhook-timestamp: 1791204110
+webhook-signature: v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=
+
+{"id":"0b7a1d6e-3c2f-4f7e-9a51-2f4c9c1e8d10","type":"job.succeeded","timestamp":"2026-10-05T12:01:47.843719Z","data":{"id":"cf788b58-9f88-4db2-99b6-54478fc1918c","url":"https://api.example.com/jobs/cf788b58-9f88-4db2-99b6-54478fc1918c","status":"succeeded","source_image_id":"da4b22bb-cb6d-46c0-a125-d2d91c82dc7b","transformations":{"flip":true},"attempts":1,"created_at":"...","started_at":"...","finished_at":"2026-10-05T12:01:47.843719Z","result":{"id":"502a037b-a7a5-4ed3-88fd-cc6d50b38358","url":"https://api.example.com/images/502a037b-a7a5-4ed3-88fd-cc6d50b38358/content","...":"..."},"error":null}}
+```
+
+`type` is `job.succeeded` or `job.failed`, `timestamp` is when the job finished, and `data` is the
+job as `GET /jobs/{id}` describes it when the event is sent (without its `webhook` field), with
+URLs under `PUBLIC_BASE_URL`. The OpenAPI document (`/docs`) describes both events under
+`webhooks`. Events are only sent for jobs that finish while you have a webhook.
+
+#### Verifying and answering
+
+Requests are signed as [Standard Webhooks](https://www.standardwebhooks.com/) specifies, so its
+libraries verify them (`pip install standardwebhooks`, then `Webhook(secret).verify(body,
+headers)`), and so does this:
+
+```python
+import base64, hmac, time
+
+def verify(secret: str, headers, body: bytes, tolerance: int = 300) -> bool:
+    key = base64.b64decode(secret.removeprefix("whsec_"))
+    msg_id, ts = headers["webhook-id"], headers["webhook-timestamp"]
+    if abs(time.time() - int(ts)) > tolerance:
+        return False
+    expected = base64.b64encode(
+        hmac.digest(key, f"{msg_id}.{ts}.".encode() + body, "sha256")
+    ).decode()
+    return any(
+        hmac.compare_digest(expected, sig.removeprefix("v1,"))
+        for sig in headers["webhook-signature"].split()
+        if sig.startswith("v1,")
+    )
+```
+
+- Verify the raw body before parsing it, and answer requests that don't verify with an error
+  status. `webhook-timestamp` is when the request was signed: refusing those more than a few
+  minutes from your clock stops replays.
+- Answer with a `2xx` status within `WEBHOOK_TIMEOUT_SECONDS` (10 s by default), and do the work
+  afterwards: a slower answer counts as a failure, and the event comes again.
+- Delivery is at least once: an event can arrive more than once, always with the same `webhook-id`
+  (its `id`). Remember the ids you have processed for at least 25 hours, or process events
+  idempotently by `data.id` (there is one event per job). Events can also arrive out of order, and
+  since the payload is built when sent, a later copy can differ (`result` becomes `null` if the
+  image was deleted meanwhile).
+
+#### Retries and delivery state
+
+Anything but a `2xx` answer (other statuses, redirects included; timeouts; connection or TLS
+failures) is retried: 30 s after the first attempt, then twice as long each time (1 min, 2 min, …,
+at most an hour), until 24 hours after the job finished, when the event is given up. Each failure
+also pauses your endpoint, for 30 s doubling with each failure in a row up to an hour, or as long
+as a `Retry-After` header (in seconds) asks, at most an hour; so a dead endpoint gets about one
+request an hour, whatever its backlog. A success resumes everything. Events are sent one at a time
+per endpoint, the one due first. Each job's `webhook` field shows its event:
+
+```json
+"webhook": {
+  "event_id": "0b7a1d6e-3c2f-4f7e-9a51-2f4c9c1e8d10",
+  "type": "job.succeeded",
+  "state": "pending",
+  "attempts": 2,
+  "last_attempt_at": "2026-10-05T12:02:18.512301Z",
+  "last_status_code": 503,
+  "last_error": "HTTP 503",
+  "next_attempt_at": "2026-10-05T12:03:18.512301Z",
+  "finished_at": null
+}
+```
+
+| `state` | Meaning |
+|---|---|
+| `pending` | Waiting to be sent, being sent, or waiting to be retried at `next_attempt_at` (or later, while your endpoint is paused or busy with older events) |
+| `delivered` | Your endpoint answered with a `2xx` status |
+| `failed` | Not delivered within 24 hours of the job finishing |
+| `canceled` | You removed the webhook first |
+
+`webhook` is `null` until the job finishes, and for jobs that finished while you had no webhook.
+`last_error` is one of `HTTP <status>` (`(redirects are not followed)` added for `3xx`),
+`Timed out after 10s`, `Could not connect` (also for a host that doesn't resolve, or resolves to
+an address that isn't allowed), `TLS handshake failed`, `Connection lost`,
+`Invalid HTTP response`, `Not delivered within 24 hours`, `Webhook removed`, why the URL is no
+longer allowed, or `Internal error` (the service's fault: retried without pausing your endpoint).
+`GET /me/webhook` shows `pending_deliveries`, `consecutive_failures` and `paused_until`.
+
+To catch up after a `failed` or `canceled` event, or on jobs that finished while you had no
+webhook, keep the ids of the jobs you submitted that haven't been reported, and list
+`GET /jobs?status=queued&status=running`: a job no longer in it has finished (`GET /jobs/{id}`).
+Jobs are listed by submission time, so one submitted earlier can finish later: don't stop at the
+newest finished job you have seen.
+
+#### Rotating the secret
+
+```bash
+curl -X POST localhost:8000/me/webhook/secret -H "Authorization: Bearer $TOKEN"
+# Optionally with -H 'Content-Type: application/json' -d '{"previous_secret_expires_in": 3600}'
+```
+
+The answer has a new `secret`. For `previous_secret_expires_in` seconds (1 day by default, at most
+7 days) requests carry two signatures, the new secret's first, so verifying with either works while
+you deploy the new one; `0` stops the previous one at once, as for a leaked secret. Only the latest
+previous secret is kept. Changing the URL keeps the secret; removing the webhook and setting it
+again issues a new one. If the operator changes `JWT_SECRET`, every secret changes: endpoints then
+reject events (which are retried for a day) until their users rotate and update them.
+
+#### Trying it locally
+
+A receiver that prints what it gets:
+
+```bash
+python - <<'EOF'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Hook(BaseHTTPRequestHandler):
+    def do_POST(self):
+        print(self.headers, self.rfile.read(int(self.headers["Content-Length"])).decode())
+        self.send_response(204)
+        self.end_headers()
+
+HTTPServer(("0.0.0.0", 9000), Hook).serve_forever()
+EOF
+```
+
+Set `PUBLIC_BASE_URL=http://localhost:8000` and `WEBHOOK_ALLOW_PRIVATE_NETWORKS=true` in `.env`
+(compose sets the former already), then `PUT /me/webhook` with `http://localhost:9000/hook`, or
+`http://host.docker.internal:9000/hook` with compose (which maps that name to your machine for the
+worker), and submit a background transformation such as `{"flip": true}` with
+`Prefer: respond-async`.
 
 ### Rate limits
 
@@ -628,9 +851,13 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   to 30 s) and retry; a job it was running then is run again once its lease has run out.
 - **Lock order**: a transaction that adds an image locks its owner's `users` row first (the quota
   check), then the new image's source (through its foreign key), then, when completing a job, the
-  job row. Deleting an image locks the image, then clears `source_image_id` on the jobs that refer
-  to it: the same order, so completing a job and deleting its source can't deadlock. Deleting
-  takes no `users` lock, and a transaction waiting for one holds no other lock.
+  job row, and last the owner's `webhook_endpoints` row (queuing the job's event; failing a job
+  locks just the job, then that row). Deleting an image locks the image, then clears
+  `source_image_id` on the jobs that refer to it: the same order, so completing a job and deleting
+  its source can't deadlock. Deleting takes no `users` lock, and a transaction waiting for one
+  holds no other lock. Webhook senders and the webhook endpoints lock an endpoint row, then
+  deliveries, in short transactions that wait for no other lock, so they can't deadlock with jobs
+  either.
 - **Storage quotas** (`app/quota.py`): usage isn't stored but summed from `images.size_bytes`
   (an index on `(owner_id) INCLUDE (size_bytes)` makes that an index-only scan), so it is exact
   after crashes, failed deletes, restores and old instances. An unlocked check refuses what
@@ -664,12 +891,49 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   they have one, so a crowd on an uncached variant converts it at most
   `SHARE_MAX_CONCURRENT_CONVERSIONS` times per process (when the result can be cached). The limit needs no Redis, so
   it holds when the cache is down. `/content` conversions aren't limited.
+- **Webhook outbox** (`app/webhooks.py`): the transaction that marks a job succeeded or failed
+  (`_finish` in `app/jobs.py`, the only code that ends a job) also inserts its event into
+  `webhook_deliveries` when the owner has a webhook. So a job never finishes without its event, and
+  a run that is rolled back or has lost its claim creates none: exactly one event per job, whose id
+  is the `webhook-id` of every attempt. Payloads are built when sent, so a payload bug can't block
+  a job. Workers still on older code finish jobs without events: upgrade the API and the workers
+  together.
+- **Webhook delivery**: each endpoint's `next_attempt_at` is its gate, when a sender should next
+  look at it (`NULL` while nothing is pending), only ever changed under the endpoint's row lock.
+  A sender claims the endpoint due first (`FOR NO KEY UPDATE SKIP LOCKED`) with a 2-minute lease
+  and a token, picks its event due first, and schedules that event's retry before sending, outside
+  any transaction; recording the outcome requires the token and an unchanged URL. So there is one
+  request at a time per endpoint across all workers; an attempt whose outcome is never recorded (a
+  crash, a lease run out, the URL changed meanwhile) is retried on schedule with the same
+  `webhook-id`, never at once; and changing the URL can't bring an event forward or start another
+  request, which is why webhook changes need no rate limit. After an attempt the endpoint goes
+  behind those already due, so endpoints take turns; a failure also pauses it. Events are given up
+  24 hours after their job finished, within the shortest `JOB_RETENTION_DAYS`, so a pending event
+  is never deleted with its job. Backlogs live in PostgreSQL: there is no in-memory queue.
+- **Webhook requests** (`app/webhook_client.py`, the only module using httpcore): URLs are
+  checked when set and before each attempt, without DNS. When connecting, the host is resolved
+  once (as an absolute name, so search domains are never tried) and refused unless every address
+  is public; IPv4-mapped and NAT64 addresses are judged by the IPv4 address inside, and cloud
+  metadata addresses are refused even with `WEBHOOK_ALLOW_PRIVATE_NETWORKS`. The connection then
+  goes to an address that was checked, while TLS verifies the certificate against the host name,
+  so DNS rebinding can't switch the target. No redirect is followed, no proxy used (`*_PROXY`
+  variables are ignored), no connection reused, and the response body is never read; one deadline
+  covers the whole attempt, so a server trickling its answer is cut off. Users only see coarse
+  errors, so webhooks can't map the internal network; logs name the refused addresses and the
+  host, never the URL's path or query, a secret or a body. Address checks can't know about internal
+  services on public addresses, split-horizon DNS or third parties that allowlist the workers: an
+  egress firewall remains the stronger protection.
+- **Webhook secrets**: a user's secret is the HMAC-SHA256 of their id and a random salt (the
+  salt is stored), under a key derived from `JWT_SECRET` with its own label: the database alone
+  reveals no secret, and there is no new key to manage. Rotating keeps the previous salt until its
+  grace period ends. Restoring a backup restores the salts of that time, and so the secrets.
 - **Orphan sweep** (`app/sweep_orphans.py`): lists the storage (`list_files`) and checks the keys
   against `images.storage_key` 1000 at a time. The grace period covers the gap between storing a
   file and committing its row: a few seconds in practice, and for a job at most its lease.
 
 ### Possible next steps
 
-Listing a user's jobs and notifying clients when a job finishes (webhooks), a limit on the
-conversions of authenticated downloads like the one for share links, and an admin API (roles) to
-replace the operator commands.
+Listing jobs by finish time (`GET /jobs?finished_after=`) for simpler catching up, a test event
+and manual redelivery for webhooks, several webhooks per account with event filters, sending
+webhooks through an egress proxy, a limit on the conversions of authenticated downloads like the
+one for share links, and an admin API (roles) to replace the operator commands.
