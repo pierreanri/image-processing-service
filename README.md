@@ -508,6 +508,7 @@ headers)`), and so does this:
 ```python
 import base64, hmac, time
 
+
 def verify(secret: str, headers, body: bytes, tolerance: int = 300) -> bool:
     key = base64.b64decode(secret.removeprefix("whsec_"))
     msg_id, ts = headers["webhook-id"], headers["webhook-timestamp"]
@@ -912,8 +913,9 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   is never deleted with its job. Backlogs live in PostgreSQL: there is no in-memory queue.
 - **Webhook requests** (`app/webhook_client.py`, the only module using httpcore): URLs are
   checked when set and before each attempt, without DNS. When connecting, the host is resolved
-  once (as an absolute name, so search domains are never tried) and refused unless every address
-  is public; IPv4-mapped and NAT64 addresses are judged by the IPv4 address inside, and cloud
+  once (as an absolute name, so search domains are never tried, except with
+  `WEBHOOK_ALLOW_PRIVATE_NETWORKS`, where that would skip `/etc/hosts`) and refused unless every
+  address is public; IPv4-mapped and NAT64 addresses are judged by the IPv4 address inside, and cloud
   metadata addresses are refused even with `WEBHOOK_ALLOW_PRIVATE_NETWORKS`. The connection then
   goes to an address that was checked, while TLS verifies the certificate against the host name,
   so DNS rebinding can't switch the target. No redirect is followed, no proxy used (`*_PROXY`

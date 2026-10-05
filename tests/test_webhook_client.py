@@ -143,6 +143,8 @@ REFUSED = [
     "::127.0.0.1",
     "::ffff:127.0.0.1",
     "::ffff:10.0.0.1",
+    "::ffff:168.63.129.16",  # Metadata addresses are matched as IPv4 addresses.
+    "::ffff:100.100.100.200",
     "64:ff9b::7f00:1",  # NAT64 of 127.0.0.1.
     "64:ff9b::a9fe:a9fe",  # NAT64 of 169.254.169.254.
     "64:ff9b:1::a00:1",
@@ -180,6 +182,8 @@ ALWAYS_REFUSED = [
     "ff02::1",
     "64:ff9b::a9fe:a9fe",
     "::ffff:169.254.169.254",
+    "::ffff:168.63.129.16",
+    "64:ff9b::a83f:8110",  # NAT64 of 168.63.129.16.
 ]
 
 
@@ -287,6 +291,18 @@ def test_the_checked_address_is_the_one_connected_to():
     assert inner.streams[0].tls_hostname == "hooks.example.com"
 
 
+def test_names_are_looked_up_as_the_system_does_in_development():
+    """/etc/hosts doesn't match absolute names: a receiver at host.docker.internal (as compose
+    maps it for workers) must still be found."""
+    resolver = RecordingResolver(["172.17.0.1"])
+    inner = RecordingBackend(b"")
+
+    backend(resolver, inner, allow_private=True).connect_tcp("host.docker.internal", 9000)
+
+    assert resolver.lookups == [("host.docker.internal", 9000)]
+    assert inner.connects == [("172.17.0.1", 9000)]
+
+
 def test_every_resolved_address_is_tried_in_turn():
     resolver = RecordingResolver(["8.8.8.8", "8.8.4.4", "8.8.8.8"])
     inner = RecordingBackend()
@@ -321,7 +337,7 @@ def test_the_sni_and_certificate_name_is_the_url_host(tls_receiver, test_ca):
     )
 
     assert outcome == Outcome(status_code=200)
-    assert resolver.lookups == [("receiver.test.", tls_receiver.port)]
+    assert resolver.lookups == [("receiver.test", tls_receiver.port)]
     assert tls_receiver.requests[0].headers["host"] == f"receiver.test:{tls_receiver.port}"
 
 

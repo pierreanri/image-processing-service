@@ -234,9 +234,11 @@ class GuardedBackend(httpcore.NetworkBackend):
             ipaddress.ip_address(host)
             addresses = [host]
         except ValueError:
-            # Absolute, so that resolv.conf's search domains are never tried.
+            # Absolute, so that resolv.conf's search domains are never tried. Not in development,
+            # where it would skip /etc/hosts too (and names such as host.docker.internal).
+            name = host if self._allow_private else host + "."
             try:
-                addresses = self._resolve(host + ".", port)
+                addresses = self._resolve(name, port)
             except OSError:
                 raise AddressNotAllowed(f"{host} could not be resolved") from None
         ips = list(dict.fromkeys(ipaddress.ip_address(address) for address in addresses))

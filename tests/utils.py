@@ -275,7 +275,7 @@ class TestCA:
     @staticmethod
     def resolve(host: str, port: int) -> list[str]:
         """A resolver that knows receiver.test (and other names under .test) as 127.0.0.1."""
-        if host.endswith(".test."):
+        if host.removesuffix(".").endswith(".test"):
             return ["127.0.0.1"]
         raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
 
