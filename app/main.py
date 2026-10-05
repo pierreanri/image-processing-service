@@ -9,7 +9,7 @@ from app.cache import get_variant_cache
 from app.config import get_settings
 from app.imaging import ImageProcessingError
 from app.ratelimit import get_transform_rate_limiter
-from app.routers import auth, images, jobs, shared
+from app.routers import auth, images, jobs, shared, webhooks
 from app.sharing import (
     ACCESS_LOG_FILTER,
     ConversionsBusyError,
@@ -18,6 +18,7 @@ from app.sharing import (
     redact_share_tokens,
 )
 from app.storage import StorageUnavailableError, get_storage
+from app.webhooks import get_webhook_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +28,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail fast on missing/invalid configuration instead of on the first request. Building the
     # Redis and S3 clients checks their settings without contacting either service (though S3
     # without explicit keys looks up credentials, e.g. from the instance metadata service).
-    get_settings()
+    settings = get_settings()
     get_storage()
     get_variant_cache()
     get_transform_rate_limiter()
     get_share_signer()
     get_share_conversion_slots()
+    get_webhook_secrets()
+    if not settings.public_base_url:
+        logger.warning("Webhooks are off: PUBLIC_BASE_URL is not set")
     # Share links are credentials, and uvicorn logs every request's path (adding the filter
     # again, e.g. on a second startup in tests, does nothing).
     logging.getLogger("uvicorn.access").addFilter(ACCESS_LOG_FILTER)
@@ -50,6 +54,8 @@ def create_app() -> FastAPI:
     app.include_router(images.router)
     app.include_router(jobs.router)
     app.include_router(shared.router)
+    app.include_router(webhooks.router)
+    app.webhooks.include_router(webhooks.events)
 
     @app.exception_handler(ImageProcessingError)
     async def image_processing_error(request: Request, exc: ImageProcessingError) -> JSONResponse:

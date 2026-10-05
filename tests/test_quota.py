@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import event, func, select, text, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings, get_settings
@@ -15,7 +15,14 @@ from app.main import app
 from app.models import Image, Job, User
 from app.quota import UNLIMITED, main, parse_size
 from app.schemas import TransformationSpec
-from tests.utils import make_image_bytes, register, share, stored_keys, user_id_of
+from tests.utils import (
+    make_image_bytes,
+    register,
+    share,
+    stored_keys,
+    user_id_of,
+    wait_for_a_lock_wait,
+)
 
 DATA = make_image_bytes()  # every upload in this module is this PNG
 SIZE = len(DATA)
@@ -334,24 +341,6 @@ def test_a_job_that_fits_exactly_succeeds(client, auth_headers, settings, worker
     worker.run_once()
 
     assert client.get(job["url"], headers=auth_headers).json()["status"] == "succeeded"
-
-
-def wait_for_a_lock_wait(timeout: float = 5) -> bool:
-    """Until some session of the test database waits for a row lock."""
-    engine = get_sessionmaker().kw["bind"]
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        with engine.connect() as probe:
-            waiting = probe.scalar(
-                text(
-                    "SELECT count(*) FROM pg_stat_activity"
-                    " WHERE datname = current_database() AND wait_event_type = 'Lock'"
-                )
-            )
-        if waiting:
-            return True
-        time.sleep(0.01)
-    return False
 
 
 def test_a_job_that_waited_on_the_quota_lock_past_its_lease_cannot_finish(

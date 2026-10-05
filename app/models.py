@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     func,
@@ -116,4 +117,102 @@ class Job(Base):
     error_detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+WEBHOOK_EVENT_TYPES = ("job.succeeded", "job.failed")
+WEBHOOK_DELIVERY_STATES = ("pending", "delivered", "failed", "canceled")
+
+
+class WebhookEndpoint(Base):
+    """A user's webhook: the URL their job events are sent to (see app/webhooks.py)."""
+
+    __tablename__ = "webhook_endpoints"
+    __table_args__ = (
+        CheckConstraint(
+            "(previous_secret_salt IS NULL) = (previous_secret_expires_at IS NULL)",
+            name="ck_webhook_endpoints_previous_secret",
+        ),
+        # Senders look for the endpoint that is due first.
+        Index(
+            "ix_webhook_endpoints_due",
+            "next_attempt_at",
+            postgresql_where=text("next_attempt_at IS NOT NULL"),
+        ),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    url: Mapped[str] = mapped_column(String(2048))
+    # The signing secret is derived from this and JWT_SECRET, never stored.
+    secret_salt: Mapped[bytes] = mapped_column(LargeBinary)
+    secret_created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # After a rotation, the previous secret also signs requests until it expires.
+    previous_secret_salt: Mapped[bytes | None] = mapped_column(LargeBinary)
+    previous_secret_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When a sender should next look at this endpoint; NULL while nothing is pending. While a
+    # sender holds it, the deadline of its lease.
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Identifies the sender holding the endpoint; NULL while none does.
+    claim_token: Mapped[uuid.UUID | None] = mapped_column()
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Nothing is sent to the endpoint before this, after a failure.
+    paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class WebhookDelivery(Base):
+    """An event about a finished job, and the state of its delivery to the owner's webhook. Its
+    id is the event's id (the webhook-id header)."""
+
+    __tablename__ = "webhook_deliveries"
+    __table_args__ = (
+        CheckConstraint(
+            "type IN ('job.succeeded', 'job.failed')", name="ck_webhook_deliveries_type"
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'delivered', 'failed', 'canceled')",
+            name="ck_webhook_deliveries_state",
+        ),
+        # A user's next delivery to attempt.
+        Index(
+            "ix_webhook_deliveries_pending",
+            "user_id",
+            "next_attempt_at",
+            postgresql_where=text("state = 'pending'"),
+        ),
+        # A user's deliveries to give up on.
+        Index(
+            "ix_webhook_deliveries_pending_created",
+            "user_id",
+            "created_at",
+            postgresql_where=text("state = 'pending'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    # One event per job, deleted with it.
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), unique=True
+    )
+    # The job's owner (no foreign key: deleting a user deletes their jobs, and so this).
+    user_id: Mapped[uuid.UUID] = mapped_column()
+    type: Mapped[str] = mapped_column(String(20))
+    state: Mapped[str] = mapped_column(String(10), default="pending", server_default="pending")
+    # Attempts started, including one in progress or interrupted.
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # While pending, the earliest time of the next attempt.
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_status_code: Mapped[int | None] = mapped_column(Integer)
+    last_error: Mapped[str | None] = mapped_column(String(100))
+    # When the job finished.
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # When the event was delivered, given up on, or canceled.
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -11,6 +11,7 @@ from app.ratelimit import RateLimiter, get_transform_rate_limiter
 from app.security import get_current_user
 from app.sharing import ConversionSlots, ShareSigner, get_share_conversion_slots, get_share_signer
 from app.storage import Storage, get_storage
+from app.webhooks import WebhookSecrets, get_webhook_secrets
 
 DbSession = Annotated[Session, Depends(get_db)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
@@ -20,3 +21,4 @@ VariantCacheDep = Annotated[VariantCache, Depends(get_variant_cache)]
 TransformRateLimiterDep = Annotated[RateLimiter, Depends(get_transform_rate_limiter)]
 ShareSignerDep = Annotated[ShareSigner, Depends(get_share_signer)]
 ShareConversionSlotsDep = Annotated[ConversionSlots, Depends(get_share_conversion_slots)]
+WebhookSecretsDep = Annotated[WebhookSecrets, Depends(get_webhook_secrets)]

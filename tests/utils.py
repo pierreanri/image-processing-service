@@ -1,10 +1,14 @@
 import io
+import time
 import uuid
 
 import jwt
 from fastapi.testclient import TestClient
 from PIL import Image
+from sqlalchemy import select, text, update
 
+from app.db import get_sessionmaker
+from app.models import WebhookDelivery, WebhookEndpoint
 from app.ratelimit import UNCHECKED, Limit, LimitState, RateLimitDecision
 from app.storage import LocalStorage
 
@@ -90,3 +94,76 @@ class FakeRateLimiter:
     def hit(self, user_id: uuid.UUID) -> RateLimitDecision:
         self.hits.append(user_id)
         return self.decision
+
+
+def wait_for_a_lock_wait(timeout: float = 5) -> bool:
+    """Until some session of the test database waits for a row lock."""
+    engine = get_sessionmaker().kw["bind"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with engine.connect() as probe:
+            waiting = probe.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity"
+                    " WHERE datname = current_database() AND wait_event_type = 'Lock'"
+                )
+            )
+        if waiting:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+# --- Webhooks -------------------------------------------------------------------------------------
+
+WEBHOOK_URL = "https://hooks.example.com/in?source=imgsvc"
+
+
+def set_webhook(client: TestClient, headers: dict, url: str = WEBHOOK_URL) -> dict:
+    """PUT /me/webhook, expecting it to create the webhook; returns the body (with the secret)."""
+    response = client.put("/me/webhook", headers=headers, json={"url": url})
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def endpoint_of(user_id: uuid.UUID) -> WebhookEndpoint | None:
+    with get_sessionmaker()() as db:
+        return db.get(WebhookEndpoint, user_id)
+
+
+def update_endpoint(user_id: uuid.UUID, **values) -> None:
+    with get_sessionmaker()() as db:
+        db.execute(
+            update(WebhookEndpoint).where(WebhookEndpoint.user_id == user_id).values(**values)
+        )
+        db.commit()
+
+
+def deliveries(user_id: uuid.UUID | None = None) -> list[WebhookDelivery]:
+    """Webhook deliveries (a user's), oldest first."""
+    query = select(WebhookDelivery).order_by(WebhookDelivery.created_at, WebhookDelivery.id)
+    if user_id is not None:
+        query = query.where(WebhookDelivery.user_id == user_id)
+    with get_sessionmaker()() as db:
+        return list(db.scalars(query))
+
+
+def delivery_of(job_id) -> WebhookDelivery | None:
+    with get_sessionmaker()() as db:
+        return db.scalar(
+            select(WebhookDelivery).where(WebhookDelivery.job_id == uuid.UUID(str(job_id)))
+        )
+
+
+def update_delivery(delivery_id: uuid.UUID, **values) -> None:
+    with get_sessionmaker()() as db:
+        db.execute(
+            update(WebhookDelivery).where(WebhookDelivery.id == delivery_id).values(**values)
+        )
+        db.commit()
+
+
+def seconds_until(moment) -> float:
+    """Seconds from the database's clock to `moment`."""
+    with get_sessionmaker()() as db:
+        return (moment - db.scalar(select(text("now()")))).total_seconds()

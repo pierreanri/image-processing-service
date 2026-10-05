@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 from fastapi import Request
 
 from app.imaging import FORMATS
-from app.models import Image, Job
-from app.schemas import ImageOut, JobError, JobOut, ShareLinkOut
+from app.models import Image, Job, WebhookDelivery
+from app.schemas import ImageOut, JobData, JobError, JobOut, ShareLinkOut, WebhookDeliveryOut
 from app.sharing import ShareLink
 
 
@@ -26,11 +26,20 @@ def image_out(image: Image, request: Request) -> ImageOut:
     )
 
 
-def job_out(job: Job, request: Request, result: Image | None) -> JobOut:
+def job_out(
+    job: Job, request: Request, result: Image | None, delivery: WebhookDelivery | None = None
+) -> JobOut:
+    return JobOut(
+        **dict(job_data(job, request, result)),
+        webhook=delivery_out(delivery) if delivery is not None else None,
+    )
+
+
+def job_data(job: Job, request: Request, result: Image | None) -> JobData:
     error = None
     if job.error_status is not None:
         error = JobError(status_code=job.error_status, detail=job.error_detail or "")
-    return JobOut(
+    return JobData(
         id=job.id,
         url=str(request.url_for("get_job", job_id=job.id)),
         status=job.status,
@@ -42,6 +51,20 @@ def job_out(job: Job, request: Request, result: Image | None) -> JobOut:
         finished_at=job.finished_at,
         result=image_out(result, request) if result is not None else None,
         error=error,
+    )
+
+
+def delivery_out(delivery: WebhookDelivery) -> WebhookDeliveryOut:
+    return WebhookDeliveryOut(
+        event_id=delivery.id,
+        type=delivery.type,
+        state=delivery.state,
+        attempts=delivery.attempts,
+        last_attempt_at=delivery.last_attempt_at,
+        last_status_code=delivery.last_status_code,
+        last_error=delivery.last_error,
+        next_attempt_at=delivery.next_attempt_at if delivery.state == "pending" else None,
+        finished_at=delivery.finished_at,
     )
 
 

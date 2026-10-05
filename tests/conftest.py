@@ -26,6 +26,11 @@ os.environ["TRANSFORM_RATE_LIMIT_PER_HOUR"] = "500"
 os.environ["SHARE_MAX_TTL_SECONDS"] = str(30 * 24 * 60 * 60)
 os.environ["SHARE_MAX_CONCURRENT_CONVERSIONS"] = "2"
 os.environ["STORAGE_QUOTA_BYTES"] = str(1024**3)
+# Webhook payloads then link to the same URLs as the API's responses to the test client.
+os.environ["PUBLIC_BASE_URL"] = "http://testserver"
+os.environ["WEBHOOK_SENDERS"] = "4"
+os.environ["WEBHOOK_TIMEOUT_SECONDS"] = "10"
+os.environ["WEBHOOK_ALLOW_PRIVATE_NETWORKS"] = "false"
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 

@@ -1,8 +1,9 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -69,6 +70,45 @@ class Settings(BaseSettings):
     # Conversions (format/quality) that downloads through share links may run at once in each
     # API process; as many more wait up to 5 s for a slot, the rest get 503.
     share_max_concurrent_conversions: int = Field(default=2, gt=0)
+
+    # Webhooks (PUT /me/webhook). The URL clients reach the API at, such as
+    # https://api.example.com: webhook payloads link to jobs and images, and workers send them
+    # without a request to take the URL from. Empty turns webhooks off.
+    public_base_url: str = ""
+    # Threads each worker sends webhooks with, beside the one that runs jobs (0: this worker
+    # sends none).
+    webhook_senders: int = Field(default=4, ge=0, le=8)
+    # How long one attempt to deliver an event may take in all: resolving the host, connecting,
+    # sending, and receiving the response's headers.
+    webhook_timeout_seconds: float = Field(default=10.0, gt=0, le=30)
+    # Development only: also allow http:// URLs, and hosts on private, loopback and similar
+    # networks (cloud metadata addresses stay refused). Never set it where users aren't trusted:
+    # it lets them make workers send requests to internal services.
+    webhook_allow_private_networks: bool = False
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _check_public_base_url(cls, value: str) -> str:
+        if not value:
+            return value
+        parts = urlsplit(value)
+        try:
+            parts.port  # noqa: B018 (raises ValueError for a malformed or out-of-range port)
+        except ValueError as exc:
+            raise ValueError(f"Invalid PUBLIC_BASE_URL {value!r}: {exc}") from None
+        if (
+            parts.scheme not in ("http", "https")
+            or not parts.hostname
+            or "@" in parts.netloc
+            or parts.query
+            or parts.fragment
+            or "?" in value
+            or "#" in value
+        ):
+            raise ValueError(
+                f"Invalid PUBLIC_BASE_URL {value!r}: expected http(s)://host[:port][/path]"
+            )
+        return value.rstrip("/")
 
 
 @lru_cache

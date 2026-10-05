@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import Settings, get_settings
 from app.db import get_sessionmaker
 from app.jobs import claim_next, fail, prune_finished, run_job
-from app.models import Image, Job, User
+from app.models import Image, Job, User, WebhookDelivery, WebhookEndpoint
 from app.storage import Storage, get_storage
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,8 @@ class Worker:
                     db.execute(select(Job).limit(1))
                     db.execute(select(Image).limit(1))
                     db.execute(select(User).limit(1))
+                    db.execute(select(WebhookEndpoint).limit(1))
+                    db.execute(select(WebhookDelivery).limit(1))
                 return True
             except SQLAlchemyError as exc:
                 if not logged:

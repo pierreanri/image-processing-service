@@ -215,7 +215,41 @@ class JobError(BaseModel):
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
 
 
-class JobOut(BaseModel):
+WebhookEventType = Literal["job.succeeded", "job.failed"]
+
+
+class WebhookDeliveryOut(BaseModel):
+    event_id: uuid.UUID = Field(
+        description="The event's id: the `webhook-id` header and the `id` your endpoint receives, "
+        "the same on every attempt."
+    )
+    type: WebhookEventType
+    state: Literal["pending", "delivered", "failed", "canceled"] = Field(
+        description="pending: waiting to be sent, being sent, or waiting to be retried; "
+        "delivered: your endpoint answered with a 2xx status; failed: not delivered within 24 "
+        "hours of the job finishing; canceled: your webhook was removed first."
+    )
+    attempts: int = Field(description="Attempts started, including one in progress or interrupted.")
+    last_attempt_at: datetime | None
+    last_status_code: int | None = Field(
+        description="The HTTP status of the last answer; null if there was none."
+    )
+    last_error: str | None = Field(
+        description="Why the last attempt failed, such as `HTTP 503` or `Could not connect`; "
+        "null once delivered."
+    )
+    next_attempt_at: datetime | None = Field(
+        description="While pending, the earliest time of the next attempt: later while your "
+        "endpoint is paused (see GET /me/webhook) or busy with older events."
+    )
+    finished_at: datetime | None = Field(
+        description="When the event was delivered, given up on, or canceled."
+    )
+
+
+class JobData(BaseModel):
+    """A job, as GET /jobs/{id} describes it and webhook events carry it."""
+
     id: uuid.UUID
     url: str = Field(description="Where to poll this job.")
     status: JobStatus
@@ -235,8 +269,78 @@ class JobOut(BaseModel):
     )
 
 
+class JobOut(JobData):
+    webhook: WebhookDeliveryOut | None = Field(
+        description="The webhook event for this job: null until the job finishes, and if you "
+        "had no webhook when it finished."
+    )
+
+
 class JobList(BaseModel):
     items: list[JobOut]
     next_cursor: str | None = Field(
         description="Pass as `cursor` to get the next page; null on the last page."
     )
+
+
+# --- Webhooks -------------------------------------------------------------------------------------
+
+
+class WebhookIn(StrictModel):
+    url: str = Field(
+        max_length=2048,
+        description="Where to POST events: an https:// URL of a public host. Redirects are not "
+        "followed.",
+    )
+
+
+class WebhookOut(BaseModel):
+    url: str
+    created_at: datetime
+    updated_at: datetime = Field(description="When the URL last changed.")
+    secret_created_at: datetime = Field(description="When the signing secret was issued.")
+    previous_secret_expires_at: datetime | None = Field(
+        description="After a rotation, until when the previous secret also signs requests; "
+        "null once it no longer does."
+    )
+    pending_deliveries: int = Field(description="Events waiting to be delivered.")
+    consecutive_failures: int = Field(
+        description="Failed attempts in a row; 0 after a successful one."
+    )
+    paused_until: datetime | None = Field(
+        description="After a failure, nothing is sent before this (30 s at first, then twice as "
+        "long after each failure in a row, at most an hour, or longer if your endpoint asked "
+        "with `Retry-After`); null when not paused."
+    )
+
+
+class WebhookSecretOut(WebhookOut):
+    secret: str = Field(
+        description="The secret requests are signed with (`whsec_` and base64), shown only now: "
+        "keep it to verify the `webhook-signature` header."
+    )
+
+
+class RotateWebhookSecretRequest(StrictModel):
+    previous_secret_expires_in: int = Field(
+        default=24 * 60 * 60,
+        ge=0,
+        le=7 * 24 * 60 * 60,
+        description="Seconds the previous secret keeps signing requests beside the new one, "
+        "while you update your endpoint (at most 7 days); 0 stops it at once, as for a leaked "
+        "secret.",
+    )
+
+
+class WebhookEvent(BaseModel):
+    """What your webhook receives when a job finishes. Verify the signature before trusting it
+    (see the README), and expect the same event more than once: deliveries are retried until
+    your endpoint answers with a 2xx status."""
+
+    id: uuid.UUID = Field(
+        description="The event's id, also in the `webhook-id` header: the same on every "
+        "attempt, so use it to ignore duplicates."
+    )
+    type: WebhookEventType
+    timestamp: datetime = Field(description="When the job finished.")
+    data: JobData = Field(description="The job, as GET /jobs/{id} describes it when sent.")

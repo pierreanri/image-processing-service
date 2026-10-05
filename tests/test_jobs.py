@@ -650,7 +650,13 @@ def test_worker_loop_backs_off_on_database_errors_and_resets(worker, monkeypatch
 
 
 @pytest.mark.parametrize(
-    ("table", "column"), [("images", "share_generation"), ("users", "storage_quota_bytes")]
+    ("table", "column"),
+    [
+        ("images", "share_generation"),
+        ("users", "storage_quota_bytes"),
+        ("webhook_endpoints", "next_attempt_at"),
+        ("webhook_deliveries", "type"),
+    ],
 )
 def test_worker_waits_until_the_database_is_fully_migrated(worker, table, column):
     """Not just until the jobs table exists: until every column the worker's code maps does."""
@@ -709,3 +715,4 @@ def test_openapi_documents_async_transforms_and_jobs():
     assert accepted["content"]["application/json"]["schema"]["$ref"].endswith("/JobOut")
     assert set(accepted["headers"]) == {"Location", "Preference-Applied"}
     assert "get" in paths["/jobs/{job_id}"]
+    assert "get" in paths["/jobs"]

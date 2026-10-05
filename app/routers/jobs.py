@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from sqlalchemy import select, tuple_
 
 from app.deps import CurrentUser, DbSession
-from app.models import Image, Job
+from app.models import Image, Job, WebhookDelivery
 from app.routers.views import job_out
 from app.schemas import JobList, JobOut, JobStatus
 
@@ -36,8 +36,9 @@ def list_jobs(
     finish.
     """
     query = (
-        select(Job, Image)
+        select(Job, Image, WebhookDelivery)
         .outerjoin(Image, Image.id == Job.result_image_id)
+        .outerjoin(WebhookDelivery, WebhookDelivery.job_id == Job.id)
         .where(Job.owner_id == user.id)
         .order_by(Job.created_at.desc(), Job.id.desc())
         .limit(limit + 1)
@@ -49,7 +50,7 @@ def list_jobs(
     rows = db.execute(query).all()
     page = rows[:limit]
     return JobList(
-        items=[job_out(job, request, result) for job, result in page],
+        items=[job_out(job, request, result, delivery) for job, result, delivery in page],
         next_cursor=_encode_cursor(page[-1].Job) if len(rows) > limit else None,
     )
 
@@ -67,9 +68,10 @@ def get_job(
     if job is None or job.owner_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
     result = db.get(Image, job.result_image_id) if job.result_image_id else None
+    delivery = db.scalar(select(WebhookDelivery).where(WebhookDelivery.job_id == job.id))
     if job.status in ("queued", "running"):
         response.headers["Retry-After"] = "1"
-    return job_out(job, request, result)
+    return job_out(job, request, result, delivery)
 
 
 def _encode_cursor(job: Job) -> str:

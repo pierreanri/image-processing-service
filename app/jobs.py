@@ -8,7 +8,8 @@ unexpired lease, so a worker whose lease ran out can neither finish nor fail the
 not another worker has taken it over yet). Processing happens outside any transaction: the
 result file is saved first, then one transaction checks the owner's storage quota, inserts the
 result image and marks the job succeeded, well within the orphan sweep's grace period (see
-app/sweep_orphans.py).
+app/sweep_orphans.py). The transaction that finishes a job also queues its webhook event (see
+app/webhooks.py).
 """
 
 import logging
@@ -27,6 +28,7 @@ from app.quota import QuotaExceededError, check_quota
 from app.schemas import TransformationSpec
 from app.storage import Storage, StorageUnavailableError
 from app.transforms import discard_file, render_transformation
+from app.webhooks import queue_job_event
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +145,8 @@ def _complete(
     with sessions() as db:
         # Locks the owner's users row first; then the image, whose foreign keys lock the source
         # image, before the job row: the order in which deleting the source locks the image and
-        # then clears jobs.source_image_id, so the two can't deadlock.
+        # then clears jobs.source_image_id, so the two can't deadlock. The owner's webhook
+        # endpoint comes last.
         try:
             check_quota(db, settings, image.owner_id, image.size_bytes, lock=True)
         except QuotaExceededError as exc:
@@ -158,17 +161,14 @@ def _complete(
             db.rollback()
             fail(sessions, claim, 404, SOURCE_GONE)
             return False
-        updated = db.execute(
-            _update_claimed(claim).values(
-                status="succeeded",
-                result_image_id=image.id,
-                finished_at=func.now(),
-                claim_token=None,
-                error_status=None,
-                error_detail=None,
-            )
-        ).rowcount
-        if not updated:
+        if not _finish(
+            db,
+            claim,
+            status="succeeded",
+            result_image_id=image.id,
+            error_status=None,
+            error_detail=None,
+        ):
             db.rollback()
             logger.info(
                 "Job %s was taken over, deleted, or its lease ran out; discarding its result",
@@ -183,18 +183,24 @@ def _complete(
 def fail(sessions: sessionmaker[Session], claim: Claim, status_code: int, detail: str) -> None:
     """Mark a job failed, if this claim still holds it."""
     with sessions() as db:
-        updated = db.execute(
-            _update_claimed(claim).values(
-                status="failed",
-                error_status=status_code,
-                error_detail=detail,
-                finished_at=func.now(),
-                claim_token=None,
-            )
-        ).rowcount
+        updated = _finish(db, claim, status="failed", error_status=status_code, error_detail=detail)
         db.commit()
     if updated:
         logger.info("Job %s failed (%s): %s", claim.job_id, status_code, detail)
+
+
+def _finish(db: Session, claim: Claim, **values: object) -> bool:
+    """Mark the job succeeded or failed (`values` sets the status and the rest), if this claim
+    still holds it, and queue its webhook event in the same transaction."""
+    owner_id = db.scalar(
+        _update_claimed(claim)
+        .values(finished_at=func.now(), claim_token=None, **values)
+        .returning(Job.owner_id)
+    )
+    if owner_id is None:
+        return False
+    queue_job_event(db, claim.job_id, owner_id, f"job.{values['status']}")
+    return True
 
 
 def _retry_later(
