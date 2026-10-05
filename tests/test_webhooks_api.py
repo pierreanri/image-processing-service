@@ -4,9 +4,10 @@ import uuid
 from datetime import timedelta
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import event, func, select
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db import get_sessionmaker
 from app.main import app
 from app.models import Job, WebhookDelivery, WebhookEndpoint
@@ -488,3 +489,40 @@ def test_openapi_documents_the_webhook_and_its_events():
     assert schemas["WebhookEvent"]["properties"]["data"]["$ref"].endswith("/JobData")
     assert "webhook" not in schemas["JobData"]["properties"]
     assert "webhook" in schemas["JobOut"]["properties"]
+
+
+# --- Settings -------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "stored"),
+    [
+        ("", ""),
+        ("https://api.example.com", "https://api.example.com"),
+        ("https://api.example.com/", "https://api.example.com"),
+        ("http://localhost:8000", "http://localhost:8000"),
+        ("https://example.com/imgsvc/", "https://example.com/imgsvc"),
+    ],
+)
+def test_public_base_url_is_checked(value, stored):
+    settings = Settings(_env_file=None, jwt_secret="x" * 32, public_base_url=value)
+
+    assert settings.public_base_url == stored
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "api.example.com",
+        "ftp://api.example.com",
+        "https://",
+        "https://user@api.example.com",
+        "https://api.example.com/?x=1",
+        "https://api.example.com/#top",
+        "https://api.example.com:99999",
+        "https://api.example.com:port",
+    ],
+)
+def test_invalid_public_base_urls_are_refused(value):
+    with pytest.raises(ValidationError, match="PUBLIC_BASE_URL"):
+        Settings(_env_file=None, jwt_secret="x" * 32, public_base_url=value)

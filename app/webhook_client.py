@@ -5,11 +5,30 @@ service's own network: its database, a cloud's instance metadata service, an adm
 URLs are checked when they are registered and before every attempt, without resolving them (a
 lookup then would prove nothing: the name can resolve elsewhere by the time of the request). The
 addresses a name resolves to are checked when connecting.
+
+Requests are sent with httpcore (the only module using it) through GuardedBackend: it resolves the
+host once, refuses it unless every address is allowed, and connects to an address it checked, so
+a name can't resolve to a public address for the check and a private one for the connection. No
+redirect is followed and no proxy used (httpcore does neither), and no connection is reused. One
+deadline bounds each attempt as a whole, so a server can't hold a sender by trickling its answer,
+and the response's body is never read.
 """
 
 import ipaddress
+import logging
 import re
+import socket
+import ssl
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
+
+import certifi
+import httpcore
+
+logger = logging.getLogger(__name__)
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
@@ -139,3 +158,257 @@ def _check_host_name(host: str, allow_private: bool) -> None:
         return
     if len(labels) == 1 or host in _LOCAL_NAMES or host.endswith(_LOCAL_SUFFIXES):
         raise ValueError("must have a public host name")
+
+
+# --- Sending ------------------------------------------------------------------------------------
+
+USER_AGENT = "imgsvc-webhooks/1"
+# The only errors users are shown (as last_error): never what a receiver, a resolver or the
+# network said, which could reveal what lies inside the service's network.
+COULD_NOT_CONNECT = "Could not connect"
+TLS_FAILED = "TLS handshake failed"
+CONNECTION_LOST = "Connection lost"
+INVALID_RESPONSE = "Invalid HTTP response"
+INTERNAL_ERROR = "Internal error"
+
+# Resolves a host name to numeric addresses (getaddrinfo, by default).
+Resolver = Callable[[str, int], list[str]]
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """The outcome of one attempt to deliver an event."""
+
+    # The response's status; None if there was none.
+    status_code: int | None = None
+    # Why the attempt failed (one of the messages above, or the status); None if it succeeded.
+    error: str | None = None
+    # Seconds the endpoint asked to wait (a Retry-After header in seconds), if it failed.
+    retry_after: int | None = None
+    # The attempt failed because of this service, not the endpoint.
+    internal: bool = False
+
+    @property
+    def delivered(self) -> bool:
+        return self.status_code is not None and 200 <= self.status_code < 300
+
+
+class AddressNotAllowed(httpcore.ConnectError):
+    """The host has no address, or one that webhooks may not be sent to."""
+
+
+class TLSFailed(httpcore.ConnectError):
+    """The TLS handshake failed, such as for a certificate that isn't valid for the host."""
+
+
+def system_resolver(host: str, port: int) -> list[str]:
+    return [info[4][0] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+
+
+class GuardedBackend(httpcore.NetworkBackend):
+    """Connects only to allowed addresses, and gives every stream the attempt's deadline (a
+    time.monotonic() value)."""
+
+    def __init__(
+        self,
+        *,
+        allow_private: bool,
+        deadline: float,
+        resolve: Resolver = system_resolver,
+        inner: httpcore.NetworkBackend | None = None,
+    ) -> None:
+        self._allow_private = allow_private
+        self._deadline = deadline
+        self._resolve = resolve
+        self._inner = inner or httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: object = None,
+    ) -> httpcore.NetworkStream:
+        try:
+            ipaddress.ip_address(host)
+            addresses = [host]
+        except ValueError:
+            # Absolute, so that resolv.conf's search domains are never tried.
+            try:
+                addresses = self._resolve(host + ".", port)
+            except OSError:
+                raise AddressNotAllowed(f"{host} could not be resolved") from None
+        ips = list(dict.fromkeys(ipaddress.ip_address(address) for address in addresses))
+        refused = [ip for ip in ips if not address_allowed(ip, self._allow_private)]
+        if not ips or refused:
+            # Never connect to any of them: a name with a private address may be an attack.
+            logger.warning(
+                "Webhook host %s refused: it resolves to %s",
+                host,
+                ", ".join(map(str, refused)) or "no address",
+            )
+            raise AddressNotAllowed(f"{host} resolves to an address that is not allowed")
+        error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
+        for ip in ips:
+            remaining = _remaining(self._deadline, httpcore.ConnectTimeout)
+            try:
+                stream = self._inner.connect_tcp(
+                    str(ip),
+                    port,
+                    timeout=remaining if timeout is None else min(timeout, remaining),
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                error = exc
+                continue
+            return DeadlineStream(stream, self._deadline)
+        raise error
+
+    def sleep(self, seconds: float) -> None:
+        self._inner.sleep(seconds)
+
+
+class DeadlineStream(httpcore.NetworkStream):
+    """A stream whose reads and writes, including the TLS handshake's, end by a deadline."""
+
+    def __init__(self, inner: httpcore.NetworkStream, deadline: float) -> None:
+        self._inner = inner
+        self._deadline = deadline
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self._inner.read(max_bytes, self._timeout(timeout, httpcore.ReadTimeout))
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self._inner.write(buffer, self._timeout(timeout, httpcore.WriteTimeout))
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        try:
+            stream = self._inner.start_tls(
+                ssl_context, server_hostname, self._timeout(timeout, httpcore.ConnectTimeout)
+            )
+        except httpcore.ConnectError as exc:
+            raise TLSFailed(str(exc)) from exc
+        # The stream every later read and write goes to: it keeps the deadline.
+        return DeadlineStream(stream, self._deadline)
+
+    def get_extra_info(self, info: str) -> object:
+        return self._inner.get_extra_info(info)
+
+    def _timeout(self, timeout: float | None, error: type[Exception]) -> float:
+        remaining = _remaining(self._deadline, error)
+        return remaining if timeout is None else min(timeout, remaining)
+
+
+def _remaining(deadline: float, error: type[Exception]) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise error("The attempt's deadline passed")
+    return remaining
+
+
+_contexts = threading.local()
+
+
+def tls_context() -> ssl.SSLContext:
+    """This thread's TLS context: certificates verified against certifi's CAs, TLS 1.2 or
+    later. One per thread, as httpcore changes the context it is given on every connection."""
+    context = getattr(_contexts, "context", None)
+    if context is None:
+        context = _contexts.context = ssl.create_default_context(cafile=certifi.where())
+    return context
+
+
+def post(
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    *,
+    timeout: float,
+    allow_private: bool,
+    resolve: Resolver = system_resolver,
+    ssl_context: ssl.SSLContext | None = None,
+    network: httpcore.NetworkBackend | None = None,
+) -> Outcome:
+    """POST a JSON `body` to a webhook `url`, within `timeout` seconds in all; only the
+    response's status and headers are read. Tests may give the resolver, the TLS context and the
+    backend that connects to the checked addresses."""
+    deadline = time.monotonic() + timeout
+    try:
+        # Again: the settings may have changed since the URL was set.
+        url = check_webhook_url(url, allow_private)
+    except ValueError as exc:
+        return Outcome(error=f"The URL {exc}"[:100])
+    parts = urlsplit(url)
+    # Built from its parts: parsing the URL again would drop ";parameters" from its path.
+    request_url = httpcore.URL(
+        scheme=parts.scheme,
+        host=parts.hostname,
+        port=parts.port,
+        target=parts.path + (f"?{parts.query}" if parts.query else ""),
+    )
+    request_headers = [
+        # httpcore would leave the brackets off an IPv6 address.
+        ("Host", parts.netloc),
+        ("User-Agent", USER_AGENT),
+        ("Content-Type", "application/json"),
+        *headers.items(),
+    ]
+    backend = GuardedBackend(
+        allow_private=allow_private, deadline=deadline, resolve=resolve, inner=network
+    )
+    timeouts = dict.fromkeys(("connect", "read", "write", "pool"), timeout)
+    try:
+        with (
+            httpcore.ConnectionPool(
+                ssl_context=ssl_context or tls_context(),
+                network_backend=backend,
+                max_connections=1,
+                max_keepalive_connections=0,
+                retries=0,
+            ) as pool,
+            pool.stream(
+                "POST",
+                request_url,
+                headers=request_headers,
+                content=body,
+                extensions={"timeout": timeouts},
+            ) as response,
+        ):
+            # Leaving without reading the body closes the connection.
+            status_code = response.status
+            retry_after = _retry_after(response.headers)
+    except httpcore.TimeoutException:
+        return Outcome(error=f"Timed out after {timeout:g}s")
+    except TLSFailed:
+        return Outcome(error=TLS_FAILED)
+    except httpcore.ConnectError:
+        return Outcome(error=COULD_NOT_CONNECT)
+    except httpcore.NetworkError:
+        return Outcome(error=CONNECTION_LOST)
+    except httpcore.ProtocolError:
+        return Outcome(error=INVALID_RESPONSE)
+    if 200 <= status_code < 300:
+        return Outcome(status_code=status_code)
+    error = f"HTTP {status_code}"
+    if 300 <= status_code < 400:
+        error += " (redirects are not followed)"
+    return Outcome(status_code=status_code, error=error, retry_after=retry_after)
+
+
+def _retry_after(headers: list[tuple[bytes, bytes]]) -> int | None:
+    """A Retry-After header in seconds (an HTTP date is ignored)."""
+    for name, value in headers:
+        if name.lower() == b"retry-after":
+            value = value.strip()
+            return int(value) if value.isdigit() else None
+    return None

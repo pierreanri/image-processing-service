@@ -49,10 +49,12 @@ from app.redis_client import create_redis_client  # noqa: E402
 from app.storage import LocalStorage, get_storage  # noqa: E402
 from app.storage_s3 import S3Storage, create_s3_client  # noqa: E402
 from app.worker import Worker  # noqa: E402
+from tests.receiver import Receiver  # noqa: E402
 from tests.utils import (  # noqa: E402
     FakeClock,
     FakeRateLimiter,
     InMemoryVariantCache,
+    TestCA,
     register,
 )
 
@@ -167,3 +169,35 @@ def redis_client():
         pytest.skip(message)
     yield client
     client.close()
+
+
+@pytest.fixture
+def receivers():
+    """Makes local webhook receivers (Receiver(...) arguments), stopped after the test."""
+    made = []
+
+    def make(**kwargs) -> Receiver:
+        made.append(Receiver(**kwargs))
+        return made[-1]
+
+    yield make
+    for receiver in made:
+        receiver.stop()
+
+
+@pytest.fixture
+def receiver(receivers) -> Receiver:
+    """A local HTTP webhook receiver."""
+    return receivers()
+
+
+@pytest.fixture(scope="session")
+def test_ca(tmp_path_factory) -> TestCA:
+    return TestCA(tmp_path_factory.mktemp("ca"))
+
+
+@pytest.fixture
+def tls_receiver(receivers, test_ca) -> Receiver:
+    """A local HTTPS webhook receiver at https://receiver.test:PORT, whose certificate test_ca
+    issued (test_ca.resolve maps receiver.test to 127.0.0.1)."""
+    return receivers(ssl_context=test_ca.server_context(), host="receiver.test")

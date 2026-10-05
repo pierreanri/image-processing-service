@@ -1,6 +1,12 @@
+import base64
+import datetime
+import hmac
 import io
+import socket
+import ssl
 import time
 import uuid
+from pathlib import Path
 
 import jwt
 from fastapi.testclient import TestClient
@@ -167,3 +173,127 @@ def seconds_until(moment) -> float:
     """Seconds from the database's clock to `moment`."""
     with get_sessionmaker()() as db:
         return (moment - db.scalar(select(text("now()")))).total_seconds()
+
+
+def verify_webhook(secret: str, headers, body: bytes, tolerance: int = 300) -> bool:
+    """The README's verification code, verbatim."""
+    key = base64.b64decode(secret.removeprefix("whsec_"))
+    msg_id, ts = headers["webhook-id"], headers["webhook-timestamp"]
+    if abs(time.time() - int(ts)) > tolerance:
+        return False
+    expected = base64.b64encode(
+        hmac.digest(key, f"{msg_id}.{ts}.".encode() + body, "sha256")
+    ).decode()
+    return any(
+        hmac.compare_digest(expected, sig.removeprefix("v1,"))
+        for sig in headers["webhook-signature"].split()
+        if sig.startswith("v1,")
+    )
+
+
+class TestCA:
+    """A throwaway certificate authority, and a certificate it issued for receiver.test."""
+
+    __test__ = False  # Not a test class.
+    HOST = "receiver.test"
+
+    def __init__(self, directory: Path) -> None:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        now = datetime.datetime.now(datetime.UTC)
+        ca_key = ec.generate_private_key(ec.SECP256R1())
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "imgsvc test CA")])
+        ca_cert = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=True,
+                    crl_sign=True,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        key = ec.generate_private_key(ec.SECP256R1())
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.HOST)]))
+            .issuer_name(ca_name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(self.HOST)]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        self.ca_pem = ca_cert.public_bytes(serialization.Encoding.PEM).decode()
+        self.cert_file = directory / "receiver.pem"
+        self.key_file = directory / "receiver.key"
+        self.cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        self.key_file.write_bytes(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+
+    def server_context(self) -> ssl.SSLContext:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.cert_file, self.key_file)
+        return context
+
+    def client_context(self) -> ssl.SSLContext:
+        """Trusts this CA only, as the webhook client's default context trusts certifi's."""
+        return ssl.create_default_context(cadata=self.ca_pem)
+
+    @staticmethod
+    def resolve(host: str, port: int) -> list[str]:
+        """A resolver that knows receiver.test (and other names under .test) as 127.0.0.1."""
+        if host.endswith(".test."):
+            return ["127.0.0.1"]
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+
+class RecordingStop:
+    """Stands in for the worker's stop event: records how long each wait() was asked to last,
+    returns at once, and is set after `waits` of them (or, so that a loop that stopped waiting
+    fails instead of spinning forever, after many more checks)."""
+
+    def __init__(self, waits: int) -> None:
+        self.waits: list[float] = []
+        self._limit = waits
+        self._checks = 0
+
+    def is_set(self) -> bool:
+        self._checks += 1
+        return len(self.waits) >= self._limit or self._checks > 10 * self._limit
+
+    def wait(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        return self.is_set()

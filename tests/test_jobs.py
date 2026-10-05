@@ -16,7 +16,15 @@ from app.main import app as api
 from app.models import Image, Job
 from app.storage import StorageUnavailableError
 from app.worker import MAX_ERROR_BACKOFF_SECONDS, stop_on_signals
-from tests.utils import ALLOWED, REJECTED, make_image_bytes, register, stored_keys, user_id_of
+from tests.utils import (
+    ALLOWED,
+    REJECTED,
+    RecordingStop,
+    make_image_bytes,
+    register,
+    stored_keys,
+    user_id_of,
+)
 
 
 @pytest.fixture(params=["local", "s3"])
@@ -597,25 +605,6 @@ def test_worker_loop_survives_database_errors(worker, monkeypatch):
     worker.run(stop)
 
     assert len(calls) == 2
-
-
-class RecordingStop:
-    """Stands in for the worker's stop event: records how long each wait() was asked to last,
-    returns at once, and is set after `waits` of them (or, so that a loop that stopped waiting
-    fails instead of spinning forever, after many more checks)."""
-
-    def __init__(self, waits: int) -> None:
-        self.waits: list[float] = []
-        self._limit = waits
-        self._checks = 0
-
-    def is_set(self) -> bool:
-        self._checks += 1
-        return len(self.waits) >= self._limit or self._checks > 10 * self._limit
-
-    def wait(self, timeout: float) -> bool:
-        self.waits.append(timeout)
-        return self.is_set()
 
 
 def test_worker_loop_prunes_first_and_waits_between_polls_when_idle(worker, monkeypatch):

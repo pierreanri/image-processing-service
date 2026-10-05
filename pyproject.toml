@@ -21,6 +21,9 @@ dependencies = [
     "pydantic-settings>=2.4",
     "python-multipart>=0.0.9",
     "redis>=6.0",
+    # Webhook requests (app/webhook_client.py): its network backend hook pins the checked address.
+    "httpcore>=1.0,<2",
+    "certifi",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +32,8 @@ dev = [
     "httpx>=0.27",
     "moto[s3]>=5.2",
     "ruff>=0.6",
+    # A throwaway CA for the webhook TLS tests.
+    "cryptography",
 ]
 
 [tool.setuptools.packages.find]
