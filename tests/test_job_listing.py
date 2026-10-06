@@ -50,6 +50,10 @@ def all_pages(client, headers, **params) -> list[list[str]]:
             return pages
 
 
+# Any valid id, the same in every run (so are the test ids that contain it).
+SOME_ID = "3f2b8c1e-5d4a-4b6f-9c0d-1e2f3a4b5c6d"
+
+
 def make_cursor(raw: str) -> str:
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
@@ -197,10 +201,10 @@ def test_invalid_listing_parameters_are_rejected(client, auth_headers, params):
         base64.b64encode(b"\xff\xfe,x").decode(),
         make_cursor("no comma here"),
         make_cursor("2026-10-05T12:00:00,") + "x",
-        make_cursor(f"2026-10-05T12:00:00,{uuid.uuid4()}"),  # No time zone.
-        make_cursor(f"yesterday,{uuid.uuid4()}"),
+        make_cursor(f"2026-10-05T12:00:00,{SOME_ID}"),  # No time zone.
+        make_cursor(f"yesterday,{SOME_ID}"),
         make_cursor("2026-10-05T12:00:00+00:00,not-a-uuid"),
-        make_cursor(f"2026-10-05T12:00:00+00:00,{uuid.uuid4()},extra"),
+        make_cursor(f"2026-10-05T12:00:00+00:00,{SOME_ID},extra"),
         "",
     ],
 )
@@ -222,9 +226,9 @@ def test_a_cursor_from_elsewhere_only_moves_the_starting_point(client, auth_head
     assert list_jobs(client, auth_headers, cursor=past)["items"] == []
 
 
-def test_the_listing_uses_the_owner_index(client, auth_headers):
-    submit_jobs(client, auth_headers, 2)
-    first = list_jobs(client, auth_headers, limit=1)
+def listing_plan(client, headers, **params) -> str:
+    """The query plan of the listing GET /jobs makes with `params` (with a cursor)."""
+    first = list_jobs(client, headers, limit=1)
     engine = get_sessionmaker().kw["bind"]
     statements = []
 
@@ -234,13 +238,26 @@ def test_the_listing_uses_the_owner_index(client, auth_headers):
 
     event.listen(engine, "before_cursor_execute", capture)
     try:
-        list_jobs(client, auth_headers, status=["queued"], cursor=first["next_cursor"])
+        list_jobs(client, headers, cursor=first["next_cursor"], **params)
     finally:
         event.remove(engine, "before_cursor_execute", capture)
     [(statement, parameters)] = statements
     with engine.connect() as conn:
         # Within the connection's transaction, which is rolled back.
         conn.exec_driver_sql("SET LOCAL enable_seqscan = off")
-        plan = conn.exec_driver_sql(f"EXPLAIN (FORMAT JSON) {statement}", parameters).scalar()
+        return str(conn.exec_driver_sql(f"EXPLAIN (FORMAT JSON) {statement}", parameters).scalar())
 
-    assert "ix_jobs_owner_id_created_at" in str(plan)
+
+def test_the_listing_uses_the_owner_index(client, auth_headers):
+    submit_jobs(client, auth_headers, 2)
+
+    assert "ix_jobs_owner_id_created_at" in listing_plan(client, auth_headers)
+    assert "ix_jobs_owner_id_created_at" in listing_plan(client, auth_headers, status="failed")
+
+
+@pytest.mark.parametrize("statuses", [["queued", "running"], ["queued"], ["running"]])
+def test_listing_unfinished_jobs_reads_only_those(client, auth_headers, statuses):
+    """What catching up on webhook events lists: not the user's whole history."""
+    submit_jobs(client, auth_headers, 2)
+
+    assert "ix_jobs_owner_unfinished" in listing_plan(client, auth_headers, status=statuses)

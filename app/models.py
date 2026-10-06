@@ -86,6 +86,14 @@ class Job(Base):
             "status IN ('queued', 'running', 'succeeded', 'failed')", name="ck_jobs_status"
         ),
         Index("ix_jobs_owner_id_created_at", "owner_id", "created_at"),
+        # Listing a user's unfinished jobs (to catch up on webhook events) reads only those.
+        Index(
+            "ix_jobs_owner_unfinished",
+            "owner_id",
+            "created_at",
+            "id",
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
         # The claim query only looks at unfinished jobs.
         Index(
             "ix_jobs_claimable",

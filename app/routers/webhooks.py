@@ -106,17 +106,19 @@ def set_webhook(
         )
 
     if endpoint.url != url:
-        endpoint.url = url
-        endpoint.updated_at = func.now()
-        # A new URL starts with a clean record. No event comes any sooner for it: each keeps
-        # the time of its next attempt.
-        endpoint.consecutive_failures = 0
-        endpoint.paused_until = None
-        db.flush()
-        # A sender holding the endpoint reschedules when it is done; its attempt, which went to
-        # the old URL, then counts for nothing.
-        if endpoint.claim_token is None:
-            reschedule(db, user.id)
+        # A new URL starts with a clean record: the pause ends, so events already due go at
+        # once, but none before the time of its next attempt. A sender holding the endpoint
+        # keeps it (and reschedules when done); its attempt, which went to the old URL, then
+        # counts for nothing.
+        reschedule(
+            db,
+            user.id,
+            unless_claimed=True,
+            url=url,
+            updated_at=func.now(),
+            consecutive_failures=0,
+            paused_until=None,
+        )
     out = _webhook_out(db, user.id)
     db.commit()
     return out

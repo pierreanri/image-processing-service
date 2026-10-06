@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
 from app.imaging import ImageProcessingError
-from app.models import Image, Job
+from app.models import Image, Job, WebhookDelivery
 from app.quota import QuotaExceededError, check_quota
 from app.schemas import TransformationSpec
 from app.storage import Storage, StorageUnavailableError
@@ -225,12 +225,21 @@ def _retry_later(
 
 
 def prune_finished(db: Session, retention_days: int) -> int:
-    """Delete jobs that finished more than `retention_days` ago; returns how many."""
+    """Delete jobs that finished more than `retention_days` ago, and their webhook events;
+    returns how many. A job whose event is still pending is kept until the event is given up
+    on (app/webhooks.py:give_up_on_expired_events), so this never takes the lock of a pending
+    event, which senders lock after their endpoint's."""
+    pending = (
+        select(WebhookDelivery.id)
+        .where(WebhookDelivery.job_id == Job.id, WebhookDelivery.state == "pending")
+        .exists()
+    )
     deleted = db.execute(
         delete(Job)
         .where(
             Job.status.in_(("succeeded", "failed")),
             Job.finished_at < func.now() - timedelta(days=retention_days),
+            ~pending,
         )
         .execution_options(synchronize_session=False)
     ).rowcount

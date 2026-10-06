@@ -9,7 +9,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import func, update
+from sqlalchemy import event, func, text, update
 from sqlalchemy.exc import OperationalError
 
 import app.webhooks
@@ -43,6 +43,7 @@ from tests.utils import (
     update_endpoint,
     user_id_of,
     verify_webhook,
+    wait_for_a_lock_wait,
 )
 
 URLS = PublicUrls(api, "http://testserver")
@@ -271,6 +272,25 @@ def test_retry_after_lengthens_the_pause_up_to_an_hour(
     # Never shorter than the endpoint's own backoff (third failure in a row: 120 s).
     assert sender.run_once()
     assert 115 < seconds_until(endpoint_of(user_id).paused_until) <= 120
+
+
+def test_an_endless_retry_after_is_an_hour(client, auth_headers, worker, sender, receiver, caplog):
+    """Python won't convert over 4300 digits: such a header must still pause the endpoint, not
+    fail the attempt as the service's fault (which would skip the pause)."""
+    user_id = user_id_of(auth_headers)
+    hook(client, auth_headers, receiver)
+    for _ in range(3):
+        finish_job(client, auth_headers, worker)
+    receiver.default = Reply(status=503, headers={"Retry-After": "9" * 5000})
+
+    assert drain(sender) == 1
+
+    [attempted] = [d for d in deliveries(user_id) if d.attempts]
+    assert (attempted.last_status_code, attempted.last_error) == (503, "HTTP 503")
+    endpoint = endpoint_of(user_id)
+    assert endpoint.consecutive_failures == 1
+    assert 3595 < seconds_until(endpoint.paused_until) <= 3600
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
 def test_a_dead_endpoint_gets_one_attempt_per_pause_whatever_its_backlog(
@@ -562,6 +582,91 @@ def test_a_canceled_event_is_not_marked_delivered(client, auth_headers, worker, 
 
     assert delivery_of(job["id"]).state == "canceled"
     assert endpoint_of(user_id).next_attempt_at is None
+
+
+def delete_user_while(engine, marker, thread_filter, run):
+    """Run `run`; once the matching thread has run a statement containing `marker`, delete the
+    user (as an operator would, in SQL) in another thread, and let `run` go on once that waits
+    for a lock. Returns the deletion's error, if any."""
+    errors = []
+    user_ids = []
+
+    def delete_user():
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": user_ids[0]})
+        except Exception as exc:  # noqa: BLE001 (reported by the test)
+            errors.append(exc)
+
+    deleter = threading.Thread(target=delete_user)
+
+    def after_statement(conn, cursor, statement, parameters, context, executemany):
+        if marker in statement and thread_filter() and not deleter.ident:
+            deleter.start()
+            assert wait_for_a_lock_wait()
+
+    event.listen(engine, "after_cursor_execute", after_statement)
+    try:
+        result = run(user_ids)
+    finally:
+        event.remove(engine, "after_cursor_execute", after_statement)
+        if deleter.ident:
+            deleter.join(10)
+    assert deleter.ident and not deleter.is_alive()
+    return result, errors
+
+
+def test_deleting_the_user_while_an_attempt_is_recorded_does_not_deadlock(
+    client, auth_headers, worker, receiver
+):
+    """Recording writes the endpoint row once, after locking it: a second write would check its
+    foreign key again, waiting for the users row the deletion holds while it waits for the
+    endpoint."""
+    user_id = user_id_of(auth_headers)
+    hook(client, auth_headers, receiver)
+    finish_job(client, auth_headers, worker)
+    with get_sessionmaker()() as db:
+        claim = claim_delivery(db)
+    engine = get_sessionmaker().kw["bind"]
+    recorder = threading.get_ident()
+
+    def record(user_ids):
+        user_ids.append(user_id)
+        with get_sessionmaker()() as db:
+            return record_attempt(db, claim, Outcome(status_code=500, error="HTTP 500"))
+
+    recorded, errors = delete_user_while(
+        engine, "FROM webhook_endpoints", lambda: threading.get_ident() == recorder, record
+    )
+
+    assert recorded is True
+    assert errors == []
+    assert endpoint_of(user_id) is None and deliveries() == []
+
+
+def test_deleting_the_user_while_a_claim_finds_nothing_due_does_not_deadlock(
+    client, auth_headers, worker, receiver
+):
+    user_id = user_id_of(auth_headers)
+    hook(client, auth_headers, receiver)
+    job = finish_job(client, auth_headers, worker)
+    update_delivery(delivery_of(job["id"]).id, next_attempt_at=func.now() + timedelta(minutes=5))
+    update_endpoint(user_id, next_attempt_at=func.now())
+    engine = get_sessionmaker().kw["bind"]
+    claimer = threading.get_ident()
+
+    def claim(user_ids):
+        user_ids.append(user_id)
+        with get_sessionmaker()() as db:
+            return claim_delivery(db)
+
+    claimed, errors = delete_user_while(
+        engine, "FROM webhook_endpoints", lambda: threading.get_ident() == claimer, claim
+    )
+
+    assert claimed is None
+    assert errors == []
+    assert endpoint_of(user_id) is None
 
 
 def test_one_request_at_a_time_per_endpoint(client, auth_headers, worker, sender, receiver):

@@ -308,9 +308,10 @@ class WebhookOut(BaseModel):
         description="Failed attempts in a row; 0 after a successful one."
     )
     paused_until: datetime | None = Field(
-        description="After a failure, nothing is sent before this (30 s at first, then twice as "
-        "long after each failure in a row, at most an hour, or longer if your endpoint asked "
-        "with `Retry-After`); null when not paused."
+        description="After a failure, nothing is sent before this: 30 s at first, then twice as "
+        "long after each failure in a row, or longer if your endpoint asked for more with "
+        "`Retry-After`, but never more than an hour. Null when not paused; changing the URL "
+        "ends the pause."
     )
 
 

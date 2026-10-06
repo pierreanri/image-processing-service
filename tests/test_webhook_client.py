@@ -475,6 +475,9 @@ def test_redirects_are_not_followed(receivers):
         ("Wed, 21 Oct 2026 07:28:00 GMT", None),
         ("-5", None),
         ("1.5", None),
+        ("9" * 5000, 10**9),  # Python won't convert over 4300 digits.
+        ("0" * 5000 + "7", 7),
+        ("1234567890", 10**9),
     ],
 )
 def test_retry_after_is_read_in_seconds(receiver, value, seconds):
@@ -509,8 +512,14 @@ def test_slow_hanging_and_trickling_endpoints_end_at_the_deadline(
     assert target.first_request.is_set()
 
 
-def test_the_deadline_also_covers_the_tls_handshake(receivers, test_ca):
-    """A server that accepts the connection and never answers the handshake."""
+def test_the_deadline_also_covers_the_tls_handshake(test_ca):
+    """A server that accepts the connection and never answers the handshake, after a slow
+    lookup: the handshake only gets what is left of the attempt's time."""
+
+    def slow_resolve(host, port):
+        time.sleep(0.4)
+        return test_ca.resolve(host, port)
+
     with socket.socket() as server:
         server.bind(("127.0.0.1", 0))
         server.listen()
@@ -519,12 +528,13 @@ def test_the_deadline_also_covers_the_tls_handshake(receivers, test_ca):
         outcome = send(
             f"https://receiver.test:{server.getsockname()[1]}/",
             timeout=0.5,
-            resolve=test_ca.resolve,
+            resolve=slow_resolve,
             ssl_context=test_ca.client_context(),
         )
 
     assert outcome == Outcome(error="Timed out after 0.5s")
-    assert time.monotonic() - started < 1.5
+    # Giving the handshake the whole timeout again would take about 0.9 s.
+    assert time.monotonic() - started < 0.75
 
 
 def test_large_responses_are_not_read(receiver):

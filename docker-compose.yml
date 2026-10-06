@@ -19,8 +19,9 @@ x-app-environment: &app-environment
   STORAGE_QUOTA_BYTES: ${STORAGE_QUOTA_BYTES:-1073741824}
   SHARE_MAX_TTL_SECONDS: ${SHARE_MAX_TTL_SECONDS:-2592000}
   SHARE_MAX_CONCURRENT_CONVERSIONS: ${SHARE_MAX_CONCURRENT_CONVERSIONS:-2}
-  # Webhooks: payloads link to the API under PUBLIC_BASE_URL (set it to the URL clients use).
-  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+  # Webhooks: payloads link to the API under PUBLIC_BASE_URL (set it to the URL clients use;
+  # PUBLIC_BASE_URL= in .env, empty, turns webhooks off).
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL-http://localhost:8000}
   WEBHOOK_SENDERS: ${WEBHOOK_SENDERS:-4}
   WEBHOOK_TIMEOUT_SECONDS: ${WEBHOOK_TIMEOUT_SECONDS:-10}
   # Development only: lets webhooks reach http:// and private addresses, such as a receiver on

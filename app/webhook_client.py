@@ -142,7 +142,11 @@ def check_webhook_url(url: str, allow_private: bool) -> str:
         )
 
     netloc = host if port is None else f"{host}:{port}"
-    return urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
+    normalized = urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
+    # Adding the "/" of an empty path can make it longer.
+    if len(normalized) > MAX_URL_LENGTH:
+        raise ValueError(f"must be at most {MAX_URL_LENGTH} characters long")
+    return normalized
 
 
 def _check_host_name(host: str, allow_private: bool) -> None:
@@ -412,5 +416,9 @@ def _retry_after(headers: list[tuple[bytes, bytes]]) -> int | None:
     for name, value in headers:
         if name.lower() == b"retry-after":
             value = value.strip()
-            return int(value) if value.isdigit() else None
+            if not value.isdigit():
+                return None
+            # Python refuses to convert over 4300 digits, and over 9 is far beyond any pause.
+            value = value.lstrip(b"0") or b"0"
+            return int(value) if len(value) <= 9 else 10**9
     return None

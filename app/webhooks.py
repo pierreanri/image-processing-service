@@ -8,7 +8,10 @@ once, retrying failures for a day.
 
 Each endpoint has a gate, `webhook_endpoints.next_attempt_at`: when a sender should next look at
 it, NULL while nothing is pending. It is only changed while holding the endpoint's row lock, so
-whoever queues an event, and every sender, sees the others' changes.
+whoever queues an event, and every sender, sees the others' changes. A transaction writes the
+endpoint row once at most (locking it first with SELECT ... FOR NO KEY UPDATE when it reads it
+before): a second write would check its foreign key again, waiting for the owner's users row,
+which deadlocks with deleting the user (that deletes the endpoint last).
 
 Senders (threads of the worker processes) claim an endpoint whose gate is due, with a lease:
 one request at a time per endpoint, across all workers. A claim also schedules the event's next
@@ -160,24 +163,32 @@ def queue_job_event(db: Session, job_id: uuid.UUID, owner_id: uuid.UUID, event_t
     )
 
 
-def reschedule(db: Session, user_id: uuid.UUID) -> None:
-    """Set the endpoint's gate from its pending deliveries: when the earliest is due, but not
-    before its pause ends, nor before now (so an endpoint just served waits for its turn behind
-    those already due). Only call it while holding the endpoint's row lock."""
+def reschedule(
+    db: Session, user_id: uuid.UUID, *, unless_claimed: bool = False, **values: object
+) -> None:
+    """Write the endpoint row: `values`, and the gate from its pending deliveries, when the
+    earliest is due, but not before its pause ends (the new pause, if `values` sets one), nor
+    before now (so an endpoint just served waits for its turn behind those already due). With
+    `unless_claimed`, a sender's lease is left as the gate. Only call it while holding the
+    endpoint's row lock, and as the transaction's only write to that row."""
     earliest = (
         select(func.min(WebhookDelivery.next_attempt_at))
         .where(WebhookDelivery.user_id == user_id, WebhookDelivery.state == "pending")
         .scalar_subquery()
     )
+    paused_until = values.get("paused_until", WebhookEndpoint.paused_until)
+    gate = case(
+        (earliest.is_(None), None),
+        else_=func.greatest(earliest, paused_until, func.now()),
+    )
+    if unless_claimed:
+        gate = case(
+            (WebhookEndpoint.claim_token.is_(None), gate), else_=WebhookEndpoint.next_attempt_at
+        )
     db.execute(
         update(WebhookEndpoint)
         .where(WebhookEndpoint.user_id == user_id)
-        .values(
-            next_attempt_at=case(
-                (earliest.is_(None), None),
-                else_=func.greatest(earliest, WebhookEndpoint.paused_until, func.now()),
-            )
-        )
+        .values(next_attempt_at=gate, **values)
         .execution_options(synchronize_session=False)
     )
 
@@ -241,13 +252,7 @@ def claim_delivery(db: Session) -> DeliveryClaim | None:
         if delivery is None:
             # Also ends the claim of a sender whose lease ran out: whoever holds the endpoint
             # next must find no stale token, or queued events would leave its gate alone.
-            db.execute(
-                update(WebhookEndpoint)
-                .where(WebhookEndpoint.user_id == user_id)
-                .values(claim_token=None)
-                .execution_options(synchronize_session=False)
-            )
-            reschedule(db, user_id)
+            reschedule(db, user_id, claim_token=None)
             db.commit()
             continue
 
@@ -301,8 +306,38 @@ def claim_delivery(db: Session) -> DeliveryClaim | None:
     return None
 
 
-def _give_up_on_expired(db: Session, user_id: uuid.UUID) -> None:
-    db.execute(
+def give_up_on_expired_events(sessions: sessionmaker[Session]) -> int:
+    """Give up on the events not delivered within RETRY_FOR that no sender has looked at since
+    (no worker sends webhooks, say), so that their jobs can be pruned; returns how many. Each
+    endpoint takes a short transaction of its own, locking the endpoint first as claims do; one
+    a sender holds is left to it."""
+    with sessions() as db:
+        user_ids = db.scalars(
+            select(WebhookDelivery.user_id)
+            .where(
+                WebhookDelivery.state == "pending",
+                WebhookDelivery.created_at <= func.now() - RETRY_FOR,
+            )
+            .distinct()
+        ).all()
+    given_up = 0
+    for user_id in user_ids:
+        with sessions() as db:
+            held = db.scalar(
+                select(WebhookEndpoint.user_id)
+                .where(WebhookEndpoint.user_id == user_id)
+                .with_for_update(skip_locked=True, key_share=True)
+            )
+            if held is None:
+                continue
+            given_up += _give_up_on_expired(db, user_id)
+            reschedule(db, user_id)
+            db.commit()
+    return given_up
+
+
+def _give_up_on_expired(db: Session, user_id: uuid.UUID) -> int:
+    return db.execute(
         update(WebhookDelivery)
         .where(
             WebhookDelivery.user_id == user_id,
@@ -317,26 +352,24 @@ def _give_up_on_expired(db: Session, user_id: uuid.UUID) -> None:
             last_error=func.coalesce(WebhookDelivery.last_error, GAVE_UP),
         )
         .execution_options(synchronize_session=False)
-    )
+    ).rowcount
 
 
 def record_attempt(db: Session, claim: DeliveryClaim, outcome: Outcome) -> bool:
     """Record an attempt's outcome and release the endpoint, unless the claim no longer holds it
     (another sender took it over, or the webhook was removed) or the URL changed meanwhile: the
     outcome then counts for nothing. Returns whether it was recorded."""
-    released = db.execute(
-        update(WebhookEndpoint)
+    held = db.execute(
+        select(WebhookEndpoint.url, WebhookEndpoint.consecutive_failures)
         .where(WebhookEndpoint.user_id == claim.user_id, WebhookEndpoint.claim_token == claim.token)
-        .values(claim_token=None)
-        .returning(WebhookEndpoint.url, WebhookEndpoint.consecutive_failures)
-        .execution_options(synchronize_session=False)
+        .with_for_update(key_share=True)
     ).one_or_none()
-    if released is None:
+    if held is None:
         db.rollback()
         return False
-    if released.url != claim.url:
+    if held.url != claim.url:
         # The event goes to the new URL at the time the claim set for its next attempt.
-        reschedule(db, claim.user_id)
+        reschedule(db, claim.user_id, claim_token=None)
         db.commit()
         return False
 
@@ -345,19 +378,12 @@ def record_attempt(db: Session, claim: DeliveryClaim, outcome: Outcome) -> bool:
     elif outcome.internal:
         breaker = {}  # Not the endpoint's fault.
     else:
-        failures = released.consecutive_failures + 1
+        failures = held.consecutive_failures + 1
         pause = max(retry_delay(failures), min(outcome.retry_after or 0, MAX_RETRY_DELAY_SECONDS))
         breaker = {
             "consecutive_failures": failures,
             "paused_until": func.now() + timedelta(seconds=pause),
         }
-    if breaker:
-        db.execute(
-            update(WebhookEndpoint)
-            .where(WebhookEndpoint.user_id == claim.user_id)
-            .values(**breaker)
-            .execution_options(synchronize_session=False)
-        )
 
     if outcome.delivered:
         values = {
@@ -382,7 +408,7 @@ def record_attempt(db: Session, claim: DeliveryClaim, outcome: Outcome) -> bool:
         .values(last_status_code=outcome.status_code, **values)
         .execution_options(synchronize_session=False)
     )
-    reschedule(db, claim.user_id)
+    reschedule(db, claim.user_id, claim_token=None, **breaker)
     db.commit()
     return True
 

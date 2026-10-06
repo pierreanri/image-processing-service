@@ -173,7 +173,9 @@ several for more throughput (`docker compose up --scale worker=3`); they share t
 worker needs the same settings as the API (database, storage) and waits at startup until the
 database is reachable and has every table and column it uses (the API container runs the
 migrations). On `SIGTERM` or `Ctrl-C` it finishes its current job, then
-exits. It also deletes finished jobs older than `JOB_RETENTION_DAYS`, at startup and hourly.
+exits. It also deletes finished jobs older than `JOB_RETENTION_DAYS`, at startup and hourly,
+first giving up on webhook events not delivered within 24 hours (a job is kept while its event is
+pending).
 
 Workers also send [webhook](#webhooks) events, from `WEBHOOK_SENDERS` threads beside the one that
 runs jobs, so a slow or hanging webhook never delays a job (they need `PUBLIC_BASE_URL`; the
@@ -540,10 +542,12 @@ def verify(secret: str, headers, body: bytes, tolerance: int = 300) -> bool:
 Anything but a `2xx` answer (other statuses, redirects included; timeouts; connection or TLS
 failures) is retried: 30 s after the first attempt, then twice as long each time (1 min, 2 min, …,
 at most an hour), until 24 hours after the job finished, when the event is given up. Each failure
-also pauses your endpoint, for 30 s doubling with each failure in a row up to an hour, or as long
-as a `Retry-After` header (in seconds) asks, at most an hour; so a dead endpoint gets about one
-request an hour, whatever its backlog. A success resumes everything. Events are sent one at a time
-per endpoint, the one due first. Each job's `webhook` field shows its event:
+also pauses your endpoint, for 30 s doubling with each failure in a row, or longer if a
+`Retry-After` header (in seconds) asks for more, but never more than an hour; so while its URL
+stays the same, a dead endpoint gets about one request an hour, whatever its backlog. A success
+resumes everything, and so does changing the URL (events already due then go at once, none before
+the time of its next attempt). Events are sent one at a time per endpoint, the one due first. Each
+job's `webhook` field shows its event:
 
 ```json
 "webhook": {
@@ -856,9 +860,12 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   locks just the job, then that row). Deleting an image locks the image, then clears
   `source_image_id` on the jobs that refer to it: the same order, so completing a job and deleting
   its source can't deadlock. Deleting takes no `users` lock, and a transaction waiting for one
-  holds no other lock. Webhook senders and the webhook endpoints lock an endpoint row, then
-  deliveries, in short transactions that wait for no other lock, so they can't deadlock with jobs
-  either.
+  holds no other lock. Webhook senders, the webhook endpoints and the prune's give-up step lock an
+  endpoint row, then deliveries, in short transactions; each writes the endpoint row once at most,
+  after locking it with `SELECT … FOR NO KEY UPDATE`. A second write would check its foreign key
+  again, waiting for the `users` row, while deleting a user (`DELETE FROM users`, which cascades
+  to images, jobs and, last, the webhook) holds that row and waits for the endpoint. The prune
+  deletes jobs only once their event is no longer pending, which no sender locks.
 - **Storage quotas** (`app/quota.py`): usage isn't stored but summed from `images.size_bytes`
   (an index on `(owner_id) INCLUDE (size_bytes)` makes that an index-only scan), so it is exact
   after crashes, failed deletes, restores and old instances. An unlocked check refuses what
@@ -906,11 +913,14 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   any transaction; recording the outcome requires the token and an unchanged URL. So there is one
   request at a time per endpoint across all workers; an attempt whose outcome is never recorded (a
   crash, a lease run out, the URL changed meanwhile) is retried on schedule with the same
-  `webhook-id`, never at once; and changing the URL can't bring an event forward or start another
-  request, which is why webhook changes need no rate limit. After an attempt the endpoint goes
-  behind those already due, so endpoints take turns; a failure also pauses it. Events are given up
-  24 hours after their job finished, within the shortest `JOB_RETENTION_DAYS`, so a pending event
-  is never deleted with its job. Backlogs live in PostgreSQL: there is no in-memory queue.
+  `webhook-id`, never at once. Changing the URL ends the endpoint's pause, but it can't start a
+  second request or send an event before the time of its next attempt: each change can release at
+  most one request early, fewer than submitting jobs already allows, which is why webhook changes
+  need no rate limit. After an attempt the endpoint goes behind those already due, so endpoints
+  take turns; a failure also pauses it. Events are given up 24 hours after their job finished,
+  when a sender next looks at the endpoint, or by the hourly prune (which also covers endpoints no
+  sender serves); a job whose event is still pending isn't pruned, so a pending event is never
+  deleted with its job. Backlogs live in PostgreSQL: there is no in-memory queue.
 - **Webhook requests** (`app/webhook_client.py`, the only module using httpcore): URLs are
   checked when set and before each attempt, without DNS. When connecting, the host is resolved
   once (as an absolute name, so search domains are never tried, except with

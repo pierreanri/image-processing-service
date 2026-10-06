@@ -5,7 +5,7 @@ from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, text
 
 from app.config import Settings, get_settings
 from app.db import get_sessionmaker
@@ -137,6 +137,22 @@ def test_overlong_urls_are_refused(client, auth_headers):
     assert put(client, auth_headers, url[:-1]).status_code == 201
 
 
+@pytest.mark.parametrize("first", [True, False], ids=["create", "change"])
+def test_urls_too_long_once_normalized_are_refused(client, auth_headers, first):
+    """A URL without a path gets "/", which can take it past the limit."""
+    if not first:
+        set_webhook(client, auth_headers)
+    url = "https://hooks.example.com?" + "a" * 2022
+    assert len(url) == 2048
+
+    response = put(client, auth_headers, url)
+
+    assert response.status_code == 422
+    assert "at most 2048 characters" in response.json()["detail"]
+    assert put(client, auth_headers, url[:-1]).status_code == (201 if first else 200)
+    assert len(endpoint_of(user_id_of(auth_headers)).url) == 2048
+
+
 def test_unknown_fields_are_refused(client, auth_headers):
     response = client.put(
         "/me/webhook", headers=auth_headers, json={"url": WEBHOOK_URL, "events": ["job.failed"]}
@@ -187,14 +203,12 @@ def test_changing_the_url_keeps_the_secret_and_clears_the_pause(client, auth_hea
     assert endpoint_of(user_id).secret_salt == salt
 
 
-def test_changing_the_url_brings_no_event_forward(client, auth_headers):
-    """The pause ends, but each event keeps the time of its next attempt: changing the URL over
-    and over can't make anything be sent sooner."""
+def test_changing_the_url_ends_the_pause_but_sends_nothing_before_its_time(client, auth_headers):
+    """The pause ends, so events already due would go at once, but each keeps the time of its
+    next attempt: changing the URL can't make an event go before that."""
     user_id = user_id_of(auth_headers)
     set_webhook(client, auth_headers)
-    delivery = add_delivery(
-        user_id, client, auth_headers, next_attempt_at=func.now() + timedelta(minutes=10)
-    )
+    add_delivery(user_id, client, auth_headers, next_attempt_at=func.now() + timedelta(minutes=10))
     update_endpoint(
         user_id,
         paused_until=func.now() + timedelta(hours=1),
@@ -206,7 +220,7 @@ def test_changing_the_url_brings_no_event_forward(client, auth_headers):
     gate = endpoint_of(user_id).next_attempt_at
     assert gate == deliveries(user_id)[0].next_attempt_at
     assert 590 < seconds_until(gate) <= 600
-    assert delivery.state == "pending"
+    assert endpoint_of(user_id).paused_until is None
 
 
 def test_changing_the_url_leaves_a_senders_claim_alone(client, auth_headers):
@@ -225,6 +239,43 @@ def test_changing_the_url_leaves_a_senders_claim_alone(client, auth_headers):
     after = endpoint_of(user_id)
     assert (after.claim_token, after.next_attempt_at) == (token, before.next_attempt_at)
     assert after.url == "https://other.example.com/4"
+
+
+def test_changing_the_url_while_the_user_is_deleted_does_not_deadlock(client, auth_headers):
+    """The change writes the endpoint row once, after locking it (see app/webhooks.py)."""
+    user_id = user_id_of(auth_headers)
+    set_webhook(client, auth_headers)
+    add_delivery(user_id, client, auth_headers)
+    engine = get_sessionmaker().kw["bind"]
+    errors = []
+
+    def delete_user():
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": user_id})
+        except Exception as exc:  # noqa: BLE001 (reported by the test)
+            errors.append(exc)
+
+    deleter = threading.Thread(target=delete_user)
+
+    def after_statement(conn, cursor, statement, parameters, context, executemany):
+        locking = "FROM webhook_endpoints" in statement and "FOR NO KEY UPDATE" in statement
+        if locking and not deleter.ident:
+            deleter.start()
+            assert wait_for_a_lock_wait()
+
+    event.listen(engine, "after_cursor_execute", after_statement)
+    try:
+        response = put(client, auth_headers, "https://other.example.com/hook")
+    finally:
+        event.remove(engine, "after_cursor_execute", after_statement)
+        if deleter.ident:
+            deleter.join(10)
+
+    assert deleter.ident and not deleter.is_alive()
+    assert response.status_code == 200
+    assert errors == []
+    assert endpoint_of(user_id) is None
 
 
 def test_a_first_put_racing_another_creates_one_webhook(client, auth_headers):

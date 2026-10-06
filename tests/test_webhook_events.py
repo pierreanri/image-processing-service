@@ -15,9 +15,10 @@ from app.db import get_sessionmaker
 from app.jobs import claim_next, prune_finished, run_job
 from app.models import Image, Job, User, WebhookDelivery, WebhookEndpoint
 from app.storage import StorageUnavailableError
-from app.webhooks import RETRY_FOR
+from app.webhooks import GAVE_UP, RETRY_FOR, give_up_on_expired_events
 from tests.utils import (
     deliveries,
+    delivery_of,
     endpoint_of,
     make_image_bytes,
     register,
@@ -417,20 +418,110 @@ def test_an_endpoint_with_a_leftover_claim_but_no_gate_is_woken(client, auth_hea
     assert -5 < seconds_until(endpoint_of(user_id).next_attempt_at) <= 0
 
 
-def test_events_are_given_up_on_before_their_jobs_can_be_pruned(client, auth_headers, worker):
-    """Retention is at least a day, and events are retried for at most a day: a pending event is
-    never deleted with its job. A finished one is."""
+def age(job_id, days=1, seconds=1) -> None:
+    """As if the job, and so its event, had finished that long ago."""
+    moment = func.now() - timedelta(days=days, seconds=seconds)
+    update_job(job_id, finished_at=moment)
+    with get_sessionmaker()() as db:
+        db.execute(
+            WebhookDelivery.__table__.update()
+            .where(WebhookDelivery.job_id == uuid.UUID(str(job_id)))
+            .values(created_at=moment)
+        )
+        db.commit()
+
+
+def test_a_pending_event_is_never_deleted_with_its_job(client, auth_headers, worker):
+    """Its job is kept until the event is given up on; then both go."""
     assert timedelta(days=1) >= RETRY_FOR
     assert type(get_settings()).model_fields["job_retention_days"].metadata[0].gt == 0
     set_webhook(client, auth_headers)
     job = queued(client, auth_headers)
     worker.run_once()
-    update_job(job["id"], finished_at=func.now() - timedelta(days=1, seconds=1))
+    age(job["id"])
 
     with get_sessionmaker()() as db:
-        assert prune_finished(db, 1) == 1
+        assert prune_finished(db, 1) == 0
+    assert [d.state for d in deliveries()] == ["pending"]
 
+    assert give_up_on_expired_events(get_sessionmaker()) == 1
+
+    assert [(d.state, d.last_error) for d in deliveries()] == [("failed", GAVE_UP)]
+    assert endpoint_of(user_id_of(auth_headers)).next_attempt_at is None
+    with get_sessionmaker()() as db:
+        assert prune_finished(db, 1) == 1
     assert deliveries() == []
+
+
+def test_the_workers_prune_gives_up_on_events_no_sender_looks_at(client, auth_headers, worker):
+    """Without any sender (WEBHOOK_SENDERS=0, say), events still end, and their jobs go."""
+    set_webhook(client, auth_headers)
+    old, recent = queued(client, auth_headers), queued(client, auth_headers)
+    worker.run_once()
+    worker.run_once()
+    age(old["id"], days=8)
+
+    worker.prune()
+
+    assert db_job(old["id"]) is None
+    assert [str(d.job_id) for d in deliveries()] == [recent["id"]]
+    assert deliveries()[0].state == "pending"
+
+
+def test_giving_up_leaves_an_endpoint_a_sender_holds_to_it(client, auth_headers, worker):
+    user_id = user_id_of(auth_headers)
+    set_webhook(client, auth_headers)
+    job = queued(client, auth_headers)
+    worker.run_once()
+    age(job["id"])
+
+    with get_sessionmaker()() as holder:
+        holder.execute(
+            select(WebhookEndpoint).where(WebhookEndpoint.user_id == user_id).with_for_update()
+        )
+        assert give_up_on_expired_events(get_sessionmaker()) == 0
+
+    assert give_up_on_expired_events(get_sessionmaker()) == 1
+
+
+def test_pruning_never_waits_for_a_pending_event(client, auth_headers, worker):
+    """Senders lock pending events (after their endpoint); pruning only deletes jobs whose event
+    has ended, so it never waits for them (nor they for it)."""
+    set_webhook(client, auth_headers)
+    pending, done = queued(client, auth_headers), queued(client, auth_headers)
+    worker.run_once()
+    worker.run_once()
+    for job in (pending, done):
+        age(job["id"])
+    finished = delivery_of(done["id"])
+    with get_sessionmaker()() as db:
+        db.execute(
+            WebhookDelivery.__table__.update()
+            .where(WebhookDelivery.id == finished.id)
+            .values(state="delivered")
+        )
+        db.commit()
+    outcome = {}
+
+    with get_sessionmaker()() as holder:
+        holder.execute(
+            select(WebhookDelivery)
+            .where(WebhookDelivery.job_id == uuid.UUID(pending["id"]))
+            .with_for_update()
+        )
+
+        def prune():
+            with get_sessionmaker()() as db:
+                outcome["deleted"] = prune_finished(db, 1)
+
+        pruner = threading.Thread(target=prune)
+        pruner.start()
+        pruner.join(5)
+        assert not pruner.is_alive()
+
+    assert outcome == {"deleted": 1}
+    assert db_job(done["id"]) is None
+    assert db_job(pending["id"]) is not None
 
 
 def test_deleting_a_user_deletes_their_webhook_and_events(client, auth_headers, worker):

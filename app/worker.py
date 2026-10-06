@@ -22,7 +22,7 @@ from app.db import get_sessionmaker
 from app.jobs import claim_next, fail, prune_finished, run_job
 from app.models import Image, Job, User, WebhookDelivery, WebhookEndpoint
 from app.storage import Storage, get_storage
-from app.webhooks import WebhookSender, get_webhook_secrets
+from app.webhooks import WebhookSender, get_webhook_secrets, give_up_on_expired_events
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,10 @@ class Worker:
         return True
 
     def prune(self) -> None:
+        # First, so that the jobs of those events can go too.
+        given_up = give_up_on_expired_events(self._sessions)
+        if given_up:
+            logger.info("Gave up on %d webhook events not delivered within 24 hours", given_up)
         with self._sessions() as db:
             deleted = prune_finished(db, self._settings.job_retention_days)
         if deleted:
