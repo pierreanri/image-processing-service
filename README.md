@@ -7,7 +7,8 @@ format, filters) and download images in different formats.
 Built with **FastAPI**, **Pillow**, **SQLAlchemy 2** and **PostgreSQL**. Files are stored on the
 local disk or in any **S3-compatible** bucket (AWS S3, Cloudflare R2, SeaweedFS, …); **Redis**
 optionally caches images converted on the fly and enforces per-user limits on transformations.
-Background transformations can notify a **webhook** when they finish.
+Background transformations can notify a **webhook** when they finish, and **signed URLs** serve
+transformed images straight to browsers and CDNs.
 
 ## Features
 
@@ -31,6 +32,11 @@ Background transformations can notify a **webhook** when they finish.
 - Share links: signed, expiring URLs (1 day by default, up to 30 days) that download one image, as
   stored or converted, without a token, to embed in a web page or send to someone. Revoking an
   image's links ends all of them at once
+- Signed URLs, in the spirit of Cloudinary's delivery URLs: your backend signs URLs that carry
+  any transformation (`…/w_800,h_600,c_cover,q_80/{image id}.webp`) with its account's key,
+  without calling the API. Variants are rendered on their first request and cached in Redis,
+  CDNs and browsers. Renders are limited per process and per account, and rotating the key ends
+  every URL
 - Conversions are cached in Redis when `REDIS_URL` is set; Redis is optional and the service keeps
   working, uncached, without it or while it is down
 - Per-user rate limits on transformations (30 per minute and 500 per hour by default), counted in
@@ -74,7 +80,7 @@ python -m app.worker          # in another terminal, for background transformati
 ```
 
 To run only the backing services in Docker: `docker compose up db redis`. The conversion cache and
-the transform rate limits are off until you set `REDIS_URL=redis://localhost:6379/0` in `.env` (the
+the rate limits are off until you set `REDIS_URL=redis://localhost:6379/0` in `.env` (the
 app logs a warning at startup while limits are configured without it). Without Docker, a suitable
 Redis is `redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --appendonly no`.
 To store images in S3 locally, start SeaweedFS with `docker compose --profile s3 up -d s3` and
@@ -87,7 +93,7 @@ Settings come from environment variables or a `.env` file.
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | `postgresql+psycopg://imgsvc:imgsvc@localhost:5432/imgsvc` | SQLAlchemy database URL |
-| `JWT_SECRET` | *(required)* | Secret used to sign tokens and share links and to derive webhook secrets, at least 32 characters; changing it logs everyone out, ends every share link and changes every webhook signing secret |
+| `JWT_SECRET` | *(required)* | Secret used to sign tokens and share links and to derive webhook secrets and URL signing keys, at least 32 characters; changing it logs everyone out, ends every share link and signed URL, and changes every webhook signing secret and URL signing key |
 | `JWT_EXPIRE_MINUTES` | `60` | Access token lifetime |
 | `STORAGE_BACKEND` | `local` | Where image files are stored: `local` or `s3` |
 | `STORAGE_DIR` | `./storage` | Directory for image files (local backend) |
@@ -98,7 +104,7 @@ Settings come from environment variables or a `.env` file.
 | `MAX_UPLOAD_BYTES` | `10485760` (10 MB) | Largest accepted upload |
 | `MAX_DIMENSION` | `10000` | Largest width/height a transformation may produce |
 | `MAX_IMAGE_PIXELS` | `50000000` | Largest pixel count accepted on upload |
-| `REDIS_URL` | *(empty: both off)* | Redis for the conversion cache and the rate limits: `redis://`, `rediss://` (TLS) or `unix://` |
+| `REDIS_URL` | *(empty: all off)* | Redis for the conversion cache and the rate limits: `redis://`, `rediss://` (TLS) or `unix://` |
 | `REDIS_TIMEOUT_SECONDS` | `0.25` | Timeout for connecting to Redis and for each read or write |
 | `CACHE_TTL_SECONDS` | `86400` (1 day) | How long an image's cached conversions live after the last one was added |
 | `CACHE_MAX_ITEM_BYTES` | `5242880` (5 MB) | Conversions larger than this are served but not cached |
@@ -111,6 +117,9 @@ Settings come from environment variables or a `.env` file.
 | `SHARE_MAX_TTL_SECONDS` | `2592000` (30 days) | Longest lifetime a share link may be given (at most a year); links last 1 day by default, or this if shorter |
 | `STORAGE_QUOTA_BYTES` | `1073741824` (1 GiB) | Bytes of images each user may store, unless they have a limit of their own (see [Storage quotas](#storage-quotas)); `0` means no limit |
 | `SHARE_MAX_CONCURRENT_CONVERSIONS` | `2` | Conversions that downloads through share links may run at once per API process; as many more wait up to 5 s, the rest get `503` |
+| `SIGNED_URL_MAX_CONCURRENT_RENDERS` | `2` | Renders (variants not in the cache) that signed URLs may run at once per API process, at most 8. One account holds at most half of them; 4 times as many requests (at most 8) wait up to 5 s, the rest get `503` (see [Limits and sizing](#limits-and-sizing)) |
+| `SIGNED_URL_RENDER_MEGAPIXELS_PER_MINUTE` | `300` | Megapixels of output each account's signed URLs may render per minute, counted in Redis; `0` turns this limit off |
+| `SIGNED_URL_RENDER_MEGAPIXELS_PER_HOUR` | `5000` | Megapixels of output each account's signed URLs may render per hour; `0` turns this limit off |
 | `PUBLIC_BASE_URL` | *(empty: webhooks off)* | The URL clients reach the API at, such as `https://api.example.com` (a path prefix is kept): webhook payloads link to jobs and images under it. While it is empty, `PUT /me/webhook` answers `503` and workers send no webhooks |
 | `WEBHOOK_SENDERS` | `4` | Threads in each worker that send webhook events (at most 8); `0`: this worker sends none |
 | `WEBHOOK_TIMEOUT_SECONDS` | `10` | How long one delivery attempt may take in all, from resolving the host to receiving the response's headers (at most 30) |
@@ -249,6 +258,9 @@ they only touch their own random keys and never flush. They are the only tests t
 limiter's Lua script, so run them before changing `app/ratelimit.py`: with
 `REQUIRE_REDIS_TESTS=1` they fail instead of being skipped when Redis is missing.
 
+The README's signed-URL samples are tested too: the Python one always, and the JavaScript one with
+Node.js 18 or later (skipped when `node` isn't on the `PATH`).
+
 Storage tests run against both backends without any server: S3 is moto's in-memory S3. Only a
 real server checks request signatures and `Content-MD5`, which `tests/test_storage_s3_server.py`
 covers against `TEST_S3_ENDPOINT_URL` (default `http://localhost:8333`, the compose SeaweedFS) and
@@ -268,8 +280,9 @@ ruff check . && ruff format --check .
 
 ## API
 
-All `/me`, `/images` and `/jobs` endpoints require an `Authorization: Bearer <token>` header; share
-links (`/shared/...`) need none, since the link itself is the credential. Requesting another
+All `/me`, `/images` and `/jobs` endpoints require an `Authorization: Bearer <token>` header. Share
+links (`/shared/...`) and signed URLs (`/signed/...`) need none, since the URL itself is the
+credential. Requesting another
 user's image or job returns `404`, too many transformations return `429` (see
 [Rate limits](#rate-limits)), and images that don't fit in your storage quota `403` (see
 [Storage quota](#storage-quota)). Errors are returned as `{"detail": ...}`.
@@ -293,6 +306,11 @@ user's image or job returns `404`, too many transformations return `429` (see
 | `POST` | `/images/{id}/share-links` | Create a share link: a URL that downloads the image without a token (see [Share links](#share-links)) |
 | `DELETE` | `/images/{id}/share-links` | Revoke every share link to the image created so far |
 | `GET` | `/shared/{token}.{ext}` | Download an image through a share link (no `Authorization` header) |
+| `POST` | `/me/url-signing-key` | Create the key your backend signs URLs with, shown only in this response (see [Signed URLs](#signed-urls)) |
+| `GET` | `/me/url-signing-key` | Your key's id and URL prefix |
+| `POST` | `/me/url-signing-key/rotate` | Replace your key: every URL signed with the old one stops working |
+| `DELETE` | `/me/url-signing-key` | Delete your key: every URL it signed stops working |
+| `GET` | `/signed/{key id}/{signature}/[{options}/]{image id}.{ext}` | Download an image transformed as a signed URL says (no `Authorization` header) |
 | `DELETE` | `/images/{id}` | Delete an image (images derived from it are kept) |
 | `GET` | `/health` | Health check |
 
@@ -655,6 +673,9 @@ RateLimit: "minute";r=0;t=13, "hour";r=469;t=3000
 Clients should tolerate these headers being absent: they are only sent while the limits are
 enforced (Redis configured and reachable).
 
+Renders through signed URLs have limits of their own: per account, in megapixels of output (see
+[Limits and sizing](#limits-and-sizing)).
+
 ### Storage quota
 
 Your images (uploads and transformation results) may take up to your storage quota: 1 GiB unless
@@ -758,6 +779,359 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   heavily viewed images, share a transformed image (its stored file is streamed, never
   re-encoded), and consider a per-IP rate limit on `/shared/` at your reverse proxy.
 
+### Signed URLs
+
+Signed URLs serve your images transformed on request, like Cloudinary's delivery URLs. Your
+backend builds and signs them itself, with no API call per URL, and puts them straight into
+`<img>` tags. Each variant is rendered on its first request, then cached by Redis, CDNs and
+browsers:
+
+```
+https://img.example.com/signed/AAECAwQFBgcICQoL/4AmFQXba4jMsNGGCkNvtzSvp/w_800,h_600,c_cover,q_80/bd06a108-6cf7-46fb-aea5-9c4437d80144.webp
+```
+
+The layout is `/signed/{key id}/{signature}/[{options}/]{image id}.{extension}`. The signature is
+made with your account's URL signing key, and the options are optional.
+
+#### Getting a key
+
+```bash
+curl -X POST localhost:8000/me/url-signing-key -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "key_id": "AAECAwQFBgcICQoL",
+  "url_prefix": "http://localhost:8000/signed/AAECAwQFBgcICQoL/",
+  "created_at": "2026-10-17T09:12:44.103985Z",
+  "key": "urlsec_Hp2rJEW6nATQNkMfVNlPS7aq8nm4jf0N-6LureE54gw"
+}
+```
+
+- **Store the key at once.** It appears only in this response, so keep it with your backend's
+  secrets.
+- **GET /me/url-signing-key** shows the key id and URL prefix again.
+- **POST /me/url-signing-key/rotate** replaces the key (see
+  [Rotating the key](#rotating-the-key-and-leaks)), and `DELETE /me/url-signing-key` removes it.
+- **One key per account.** Creating a second one answers `409`.
+- **The URL prefix** comes from the URL your request reached the API at. Behind a CDN, use the
+  CDN's host with the same path.
+
+#### Building URLs
+
+Options are comma-separated tokens, written in this order, each at most once:
+
+| Token | In `POST /transform` | Notes |
+|---|---|---|
+| `crop_X_Y_W_H` | `crop` | |
+| `w_N`, `h_N` | `resize` `width`, `height` | |
+| `c_contain`, `c_cover` | `resize` `fit` | Only with both `w_` and `h_`. `fill` is the default |
+| `a_DEG` | `rotate` | Between 0 and 360, exclusive: `-90` is `a_270` |
+| `flip`, `mirror` | `flip`, `mirror` | |
+| `blur_R` | `filters` `blur` | |
+| `sharpen`, `grayscale`, `sepia` | `filters` | |
+| `wm_TEXT` | `watermark` `text` | The text's UTF-8 bytes as unpadded base64url: `© Alice` is `wqkgQWxpY2U` |
+| `g_POS` | `watermark` `position` | `top-left`, `top-right`, `bottom-left` or `center`. `bottom-right` is the default |
+| `o_PCT` | `watermark` `opacity` | 0 to 100 (percent). 50 is the default |
+| `fs_PX` | `watermark` `size` | |
+| `q_N` | `quality` | Only for `.jpg` and `.webp` |
+| `exp_SECONDS` | | The expiry, in Unix seconds (see [Expiry](#expiry)) |
+
+**The extension is the output format:** `.jpg`, `.png`, `.webp`, `.gif`, `.bmp` or `.tiff`
+(there is no `f_` token). A URL without options serves the stored file as uploaded when its
+extension is the stored format's, and converts it otherwise. Limits and order of application are
+those of [Transformations](#transformations).
+
+**Each variant has exactly one spelling.** A URL spelled any other way answers `422`, and the
+detail names the right spelling (`sign "w_800,h_600" instead`). The rules:
+- tokens follow the table's order;
+- defaults are left out: `c_fill`, `g_bottom-right`, `o_50`, `a_0`, and `q_` on lossless
+  formats;
+- integers have no sign or leading zeros;
+- decimals are rounded to 2 decimals, with no trailing zeros: `a_12.5`, `blur_2`;
+- options that change nothing are left out, together with their `/`.
+
+**The signature** is the first 24 characters of the unpadded base64url HMAC-SHA256 of everything
+after it (`[{options}/]{image id}.{extension}`), keyed with the key string, `urlsec_` included.
+
+**Send a URL exactly as signed.** A URL with percent-encoding (such as `%2C` for a comma) or any
+query string is refused with `404`, so each variant has one URL and one cache entry. Image ids
+are lowercase, as the API writes them.
+
+These functions build URLs from the `transformations` that `POST /images/{id}/transform` takes.
+The tests check both of them against the server's own spelling.
+
+<!-- signed-url-sample python -->
+```python
+import base64
+import hmac
+
+
+def _number(value):
+    # Rounded to 2 decimals, without trailing zeros.
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def signed_url(url_prefix, key, image_id, format, transformations=None, expires=None):
+    """The URL of an image rendered as `format` ("jpeg", "png", "webp", "gif", "bmp" or "tiff")
+    with POST /transform's `transformations` (without "format"), working until the Unix time
+    `expires` if given. `url_prefix` and `key` are what POST /me/url-signing-key returned."""
+    t = transformations or {}
+    tokens = []
+    if crop := t.get("crop"):
+        x, y = crop.get("x") or 0, crop.get("y") or 0
+        tokens.append(f"crop_{int(x)}_{int(y)}_{int(crop['width'])}_{int(crop['height'])}")
+    if resize := t.get("resize"):
+        width, height = resize.get("width"), resize.get("height")
+        if width is not None:
+            tokens.append(f"w_{int(width)}")
+        if height is not None:
+            tokens.append(f"h_{int(height)}")
+        if width is not None and height is not None and (resize.get("fit") or "fill") != "fill":
+            tokens.append(f"c_{resize['fit']}")
+    if t.get("rotate") and t["rotate"] % 360:
+        angle = _number(t["rotate"] % 360)
+        if angle in ("0", "360"):
+            raise ValueError("rotate: too close to a whole turn for 2 decimals")
+        tokens.append(f"a_{angle}")
+    tokens += [name for name in ("flip", "mirror") if t.get(name)]
+    filters = t.get("filters") or {}
+    if filters.get("blur") is not None:
+        radius = _number(filters["blur"])
+        if radius in ("0", "-0"):
+            raise ValueError("blur: too small for 2 decimals")
+        tokens.append(f"blur_{radius}")
+    tokens += [name for name in ("sharpen", "grayscale", "sepia") if filters.get(name)]
+    if watermark := t.get("watermark"):
+        text = base64.urlsafe_b64encode(watermark["text"].encode()).decode().rstrip("=")
+        tokens.append(f"wm_{text}")
+        if (watermark.get("position") or "bottom-right") != "bottom-right":
+            tokens.append(f"g_{watermark['position']}")
+        opacity = watermark.get("opacity")
+        if opacity is not None and round(opacity * 100) != 50:
+            tokens.append(f"o_{round(opacity * 100)}")
+        if watermark.get("size") is not None:
+            tokens.append(f"fs_{int(watermark['size'])}")
+    if t.get("quality") is not None and format in ("jpeg", "webp"):
+        tokens.append(f"q_{int(t['quality'])}")
+    if expires is not None:
+        tokens.append(f"exp_{int(expires)}")
+
+    path = f"{image_id}.{'jpg' if format == 'jpeg' else format}"
+    if tokens:
+        path = ",".join(tokens) + "/" + path
+    digest = hmac.digest(key.encode(), path.encode(), "sha256")
+    return f"{url_prefix}{base64.urlsafe_b64encode(digest).decode()[:24]}/{path}"
+```
+
+<!-- signed-url-sample js -->
+```js
+import { createHmac } from "node:crypto";
+
+// Rounded to 2 decimals, without trailing zeros.
+const number = (value) => value.toFixed(2).replace(/\.?0+$/, "");
+
+/**
+ * The URL of an image rendered as `format` ("jpeg", "png", "webp", "gif", "bmp" or "tiff") with
+ * POST /transform's `transformations` (without "format"), working until the Unix time `expires`
+ * if given. `urlPrefix` and `key` are what POST /me/url-signing-key returned.
+ */
+export function signedUrl(urlPrefix, key, imageId, format, transformations, expires) {
+  const t = transformations ?? {};
+  const tokens = [];
+  if (t.crop) {
+    const { x, y, width, height } = t.crop;
+    tokens.push(`crop_${x ?? 0}_${y ?? 0}_${width}_${height}`);
+  }
+  if (t.resize) {
+    const { width, height, fit } = t.resize;
+    if (width != null) tokens.push(`w_${width}`);
+    if (height != null) tokens.push(`h_${height}`);
+    if (width != null && height != null && (fit ?? "fill") !== "fill") tokens.push(`c_${fit}`);
+  }
+  const turn = (((t.rotate ?? 0) % 360) + 360) % 360;
+  if (turn) {
+    const angle = number(turn);
+    if (angle === "0" || angle === "360") {
+      throw new Error("rotate: too close to a whole turn for 2 decimals");
+    }
+    tokens.push(`a_${angle}`);
+  }
+  for (const name of ["flip", "mirror"]) if (t[name]) tokens.push(name);
+  const filters = t.filters ?? {};
+  if (filters.blur != null) {
+    const radius = number(filters.blur);
+    if (radius === "0" || radius === "-0") throw new Error("blur: too small for 2 decimals");
+    tokens.push(`blur_${radius}`);
+  }
+  for (const name of ["sharpen", "grayscale", "sepia"]) if (filters[name]) tokens.push(name);
+  if (t.watermark) {
+    const { text, position, opacity, size } = t.watermark;
+    tokens.push(`wm_${Buffer.from(text, "utf8").toString("base64url")}`);
+    if ((position ?? "bottom-right") !== "bottom-right") tokens.push(`g_${position}`);
+    if (opacity != null && Math.round(opacity * 100) !== 50) {
+      tokens.push(`o_${Math.round(opacity * 100)}`);
+    }
+    if (size != null) tokens.push(`fs_${size}`);
+  }
+  if (t.quality != null && (format === "jpeg" || format === "webp")) tokens.push(`q_${t.quality}`);
+  if (expires != null) tokens.push(`exp_${expires}`);
+
+  let path = `${imageId}.${format === "jpeg" ? "jpg" : format}`;
+  if (tokens.length) path = `${tokens.join(",")}/${path}`;
+  const signature = createHmac("sha256", key).update(path).digest("base64url").slice(0, 24);
+  return `${urlPrefix}${signature}/${path}`;
+}
+```
+
+For example (`signedUrl` takes the same arguments):
+
+```python
+signed_url(
+    "https://img.example.com/signed/AAECAwQFBgcICQoL/",
+    "urlsec_Hp2rJEW6nATQNkMfVNlPS7aq8nm4jf0N-6LureE54gw",
+    "bd06a108-6cf7-46fb-aea5-9c4437d80144",
+    "webp",
+    {
+        "resize": {"width": 800, "height": 600, "fit": "cover"},
+        "watermark": {"text": "© Alice, a/b_c", "position": "top-left", "opacity": 0.3},
+        "quality": 80,
+    },
+    expires=1791204110,
+)
+# https://img.example.com/signed/AAECAwQFBgcICQoL/PXOraXUEvaKLf6kVuLzhWcxS/w_800,h_600,c_cover,wm_wqkgQWxpY2UsIGEvYl9j,g_top-left,o_30,q_80,exp_1791204110/bd06a108-6cf7-46fb-aea5-9c4437d80144.webp
+```
+
+Both functions raise when a nonzero `rotate` or `blur` would round to nothing at 2 decimals. If
+they didn't, the URL would silently drop the transformation.
+
+The syntax looks like Cloudinary's, with these differences:
+- `c_contain` and `c_cover`, where Cloudinary has `c_fit` and `c_fill`;
+- watermarks are a text token;
+- the options are one segment, with no chained transformations;
+- the format comes from the extension (no `f_auto`), and quality is a number (no `q_auto`);
+- there is only one spelling of each URL.
+
+#### Expiry
+
+`exp_` (Unix seconds, always last) makes a URL stop working at that second: from then on it
+answers `410`, and no cache is told to keep it longer (see
+[Caching and CDNs](#caching-and-cdns)). Without `exp_`, a URL works until the key is rotated or
+deleted, or the image deleted.
+
+Expiring URLs are marked `X-Robots-Tag: noindex`. Pages built at different times give the same
+URL, and so reuse browser caches, if they round the expiry (to the end of the week, say).
+
+#### Responses
+
+| Status | When | `Cache-Control` |
+|---|---|---|
+| `200` | The image: the stored file streamed, or the variant from the cache or rendered now | `public, max-age=2592000, s-maxage=3600, immutable`, both at most until `exp_` |
+| `304` | `If-None-Match` matches | The same |
+| `404` `{"detail": "Signed URL not found"}` | Not signed with the key its key id names (changed, truncated, or signed with another key), or not sent exactly as signed | `no-store` |
+| `410` `{"detail": "Signed URL expired at 2026-10-05T12:41:50Z"}` | `exp_` has passed | `public, max-age=3600` |
+| `410` `{"detail": "Signed URL has been revoked"}` | The key was rotated or deleted, or the image deleted or not the key's account's (a URL never tells which) | `public, max-age=3600` |
+| `422` `{"detail": "Invalid signed URL options: …"}` | Correctly signed, but the options are invalid or not in their one spelling | `no-store` |
+| `400`, `415`, `422` | The transformation can't be applied to this image (a crop outside it, a result over `MAX_DIMENSION`), with the detail `POST /transform` gives | `public, max-age=300` |
+| `429` with `Retry-After` | The account's signed URLs rendered too much (see [Limits](#limits-and-sizing)) | `no-store` |
+| `503` with `Retry-After` | Storage unavailable, or too many renders in progress | `no-store` |
+
+- **Any page can embed or fetch them.** Every answer carries `Access-Control-Allow-Origin: *`,
+  and images also carry `Cross-Origin-Resource-Policy: cross-origin`.
+- **`HEAD` isn't supported** (`405`).
+- **`Authorization` headers are ignored.**
+
+#### Caching and CDNs
+
+A variant never changes, since images are immutable and the options are signed:
+- **Browsers** keep a variant for 30 days without revalidating (`immutable`).
+- **Shared caches** (CDNs, proxies) keep it for an hour, then revalidate. That is a cheap `304`:
+  one indexed query, with no storage access and no render.
+
+To put a CDN in front of `/signed/`, have your backend sign URLs under the CDN's prefix. The CDN
+only needs to follow the API's `Cache-Control` and key entries on the path: no query string,
+cookie or header changes the answer.
+
+Revoking (rotating or deleting the key, or deleting the image) takes effect:
+
+| Where | When |
+|---|---|
+| The API | At once |
+| CDNs and proxies | Within the hour, or at once if you purge `/signed/{key id}/` |
+| Browsers that already have the image | When their copy expires: up to 30 days, or at `exp_` |
+
+Images that must disappear from screens promptly need a short `exp_`. Alternatively, share them
+with [share links](#share-links), which are cached privately and for an hour at most.
+
+**The API's Redis cache** also keeps rendered variants (see `CACHE_TTL_SECONDS`), next to the
+image's conversions, so deleting the image drops them:
+- A URL that only converts (such as `q_70/{id}.webp`, or another extension without options)
+  shares its cache entry and ETag with `/content?format=&quality=` and share links.
+- `exp_` isn't part of the variant: URLs that differ only in their expiry share one render, but
+  not one CDN entry.
+
+#### Rotating the key, and leaks
+
+The key is a password. Whoever has it can sign any transformation of any image your account
+has, though not use the API or reach other accounts' images. Keep it on your backend, never in a
+browser or a mobile app. A URL shows its key id, image id and options, but nothing of the key.
+
+`POST /me/url-signing-key/rotate` replaces the key and its key id at once, and shows the new key
+in its response only:
+- every URL signed with the old key answers `410` from then on;
+- there is no grace period, so rebuild your pages with URLs signed by the new key;
+- if the key leaked, rotate it, deploy the new key, then purge `/signed/{old key id}/` from your
+  CDN.
+
+Changing `JWT_SECRET` changes every account's key, though the key ids stay the same. Every
+signed URL then answers `404`, until each account rotates its key to get the new one.
+
+#### Limits and sizing
+
+Rendering a variant that isn't cached is the expensive part. A page full of new URLs triggers
+many renders, and so does Redis being down. An account, or anyone with its key, can also make up
+any number of variants. Renders are therefore limited in three ways.
+
+1. **Per API process.** At most `SIGNED_URL_MAX_CONCURRENT_RENDERS` renders run at once (2 by
+   default), apart from share links' conversions.
+   - One account holds at most half of these slots, and at least one.
+   - Up to 4 times as many requests (at most 8) wait up to 5 s for a slot; the rest get `503`.
+   - A request that waited looks in the cache again, so a crowd on a new variant renders it once
+     per process.
+2. **Per account, in megapixels of output.** By default an account's signed URLs may render 300
+   megapixels per minute and 5000 per hour, counted in Redis like the transformation limits (and
+   not enforced without it).
+   - A render costs its output's width × height in megapixels, rounded up, and at least 1.
+   - Cached variants, `304`s and stored files cost nothing.
+   - Over the limit, renders get `429` with `Retry-After`. There are no `RateLimit` fields:
+     viewers aren't the account.
+3. **Per render.** Renders have the limits of `POST /transform` (`MAX_DIMENSION`,
+   `MAX_IMAGE_PIXELS`). A crop outside the image, or a result that would be too large, is refused
+   from the image's stored size, before the image is read.
+
+**Memory.** A render's memory peaks at a few copies of the larger of its source and its result.
+At the defaults (50-megapixel sources, 10000 × 10000 results, 4 bytes a pixel), budget about 2 GB
+per render slot. That comes on top of share links' conversions and `POST /transform`s.
+
+**Threads.** Each waiting or rendering request holds one of the API process's 40 worker threads;
+with the defaults, signed URLs take at most 2 + 8 = 10 of them.
+
+On small machines, lower `MAX_DIMENSION` or the number of slots. For more render throughput, run
+more API processes: each has slots of its own.
+
+#### Share links or signed URLs?
+
+| | Share links | Signed URLs |
+|---|---|---|
+| Made by | An API call per link | Your backend, with no API call |
+| Serve | The stored file, or a conversion | Any transformation |
+| Caching | Private, for an hour at most | Public: CDNs for an hour, browsers for 30 days |
+| Expiry | Always, at most `SHARE_MAX_TTL_SECONDS` | Optional |
+| Revoking | All of one image's links | All of an account's URLs (rotating the key), or one image's (deleting it) |
+
+Use share links to send someone an image, or to embed one for a while. Use signed URLs to serve
+your application's images at scale.
+
 ## Design notes
 
 - **Layout**: `app/imaging.py` holds all Pillow logic and has no web or database dependencies;
@@ -792,9 +1166,9 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   verifies, instead of boto3's default `aws-chunked` checksums, which several S3-compatible servers
   reject.
 - **Conversion cache** (`app/cache.py`): each image's conversions live in one Redis hash,
-  `imgsvc:variants:v1:{image id}`, whose fields are the ETag variants (`webp-qdefault`, `jpeg-q40`,
-  …). Lossless formats ignore `quality`, so they get one entry and one ETag. The cache is only read
-  after the ownership (or share-link) check, the `304` check and the original-file check, so it can
+  `imgsvc:variants:v1:{image id}`, whose fields are the ETag variants: conversions like
+  `webp-qdefault` and `jpeg-q40`, and signed URLs' transformations like `webp-t{hash}`. Lossless formats ignore `quality`, so they get one entry and one ETag. The cache is only read
+  after the ownership (share-link, signed-URL) check, the `304` check and the original-file check, so it can
   never serve one user's image to another. Deleting an image drops its hash; if that fails (Redis down), the
   leftover can't be served and expires with the TTL. Bump `v1` when encoder output changes.
 - **Cache memory**: the TTL is refreshed whenever a conversion is added, entries over
@@ -811,8 +1185,8 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
 - **Rate limiting** (`app/ratelimit.py`): each limit is a fixed window that starts with a user's
   first counted transformation and ends when its Redis key
   (`imgsvc:ratelimit:v1:transform:{user id}:minute|hour`) expires, so every API instance agrees.
-  One Lua script checks every limit and counts the request against all of them, or against none if
-  any is used up. Fixed windows allow a burst of up to twice a limit around a window boundary (e.g.
+  One Lua script checks every limit and counts the request (its cost: 1, or a render's megapixels)
+  against all of them, or against none if any is used up. Fixed windows allow a burst of up to twice a limit around a window boundary (e.g.
   59 transformations within a second with the defaults). Limits are per account, don't bound
   concurrency, and `/register` isn't limited. If the connection breaks after Redis ran the script,
   the retry can use up one extra slot (the request is counted twice, or counted and then refused).
@@ -820,8 +1194,8 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   are allowed without being counted (one warning per outage, then Redis is skipped for 5 seconds, as
   for the cache). Losing counters (a restart without persistence, eviction, a failover) only resets
   windows early. Keep `allkeys-lru` (or `volatile-lru`); never `volatile-ttl`, which would evict the
-  counters before cached conversions. A Redis ACL user needs `+get +incr +expire +pttl +evalsha
-  +script|load` on `~imgsvc:*` for the limiter (plus the hash commands for the cache).
+  counters before cached conversions. A Redis ACL user needs `+get +incrby +expire +pttl +evalsha
+  +script|load` on `~imgsvc:*` for the limiters (plus the hash commands for the cache).
 - **Redis timeouts**: `REDIS_TIMEOUT_SECONDS` bounds each connection attempt, read and write, for
   both the cache and the limiter. While Redis stops answering, requests already in flight each wait
   up to that long before it is skipped. A hostname with several addresses is tried one address at a
@@ -894,11 +1268,48 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
   `UPDATE images SET share_generation = share_generation + 1000000` (adding 1 can revive links
   revoked in between). Revoking takes a lock that doesn't conflict with a job's result insert.
 - **Share-link conversions**: conversions through links that miss the cache wait for one of
-  `SHARE_MAX_CONCURRENT_CONVERSIONS` slots per process (a semaphore; only as many requests as there
-  are slots may wait, up to 5 s, since each holds an API thread), and look in the cache again once
+  `SHARE_MAX_CONCURRENT_CONVERSIONS` slots per process (counted under a lock; only as many requests as
+  there are slots may wait, up to 5 s, since each holds an API thread), and look in the cache again once
   they have one, so a crowd on an uncached variant converts it at most
   `SHARE_MAX_CONCURRENT_CONVERSIONS` times per process (when the result can be cached). The limit needs no Redis, so
   it holds when the cache is down. `/content` conversions aren't limited.
+- **Signed URL keys** (`app/signed_urls.py`): a key is `urlsec_` plus the HMAC-SHA256 of its key id,
+  under a key derived from `JWT_SECRET` with its own label. Only the key id is stored, so the
+  database alone reveals no key and there is no new key to manage. Key ids are random and never
+  reused, so a rotated key's URLs can't come back.
+- **Checking a signed URL** (`app/routers/signed.py`) starts without any I/O:
+  - The path must be sent as is (no `%`, no query string). Starlette routes on the decoded path,
+    so otherwise one variant would have many URLs.
+  - Then come the shapes of the key id, the signature and the signed path, and the signature,
+    compared in constant time. A forged URL costs two HMACs and gets a `404` before any database,
+    Redis or storage access.
+  - The signature (144 bits) covers everything after it: the options, the image id and the
+    extension.
+  - The options are parsed leniently, validated as `POST /transform` validates them, encoded again
+    and compared byte for byte: so every variant has one URL (one cache entry, one CDN object),
+    and a URL's holder can't vary it to make new renders.
+  - The expiry comes next. Then one statement loads the image joined to the key on its owner, so
+    a rotated or deleted key, a deleted image and another account's image all look alike (`410`),
+    and only then can the URL answer `304`.
+- **Preflight** (`predict_output_size` in `app/imaging.py`): the output size is computed from the
+  stored dimensions. The computation mirrors the crop, the resize (including `contain`'s rounding)
+  and Pillow's arithmetic for rotations that expand the canvas. So a URL that would fail on size
+  is refused before the image is read, and the size it predicts is what the render costs.
+  `apply_transformations` runs the same check first, so `POST /transform` and jobs no longer
+  allocate a huge rotated canvas only to refuse it.
+- **Signed URL renders** share `send_variant` with `/content` and share links:
+  1. The variant cache is read.
+  2. On a miss, the account's megapixel budget is checked without counting, so an account over
+     its budget gets a `429` without taking a waiting place.
+  3. The request waits for one of the signed render slots. These are separate from share links'
+     and are counted per account as well as in all.
+  4. With a slot, it looks in the cache again (a request it waited for may have rendered the same
+     variant), and only then counts the megapixels and renders.
+
+  The budget uses the transform limiter's Lua script with a cost (`INCRBY`), under
+  `imgsvc:ratelimit:v1:render:{user id}:minute|hour`, and fails open like it. Transformations are
+  cached as `{format}-t{hash}`, the hash being the first 32 hex digits of the SHA-256 of the
+  canonical options without `exp_`. Conversion-only URLs use the conversions' tokens.
 - **Webhook outbox** (`app/webhooks.py`): the transaction that marks a job succeeded or failed
   (`_finish` in `app/jobs.py`, the only code that ends a job) also inserts its event into
   `webhook_deliveries` when the owner has a webhook. So a job never finishes without its event, and
@@ -945,7 +1356,18 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
 
 ### Possible next steps
 
-Listing jobs by finish time (`GET /jobs?finished_after=`) for simpler catching up, a test event
-and manual redelivery for webhooks, several webhooks per account with event filters, sending
-webhooks through an egress proxy, a limit on the conversions of authenticated downloads like the
-one for share links, and an admin API (roles) to replace the operator commands.
+- **Jobs:** listing by finish time (`GET /jobs?finished_after=`) for simpler catching up.
+- **Webhooks:**
+  - a test event, and manual redelivery;
+  - several webhooks per account, with event filters;
+  - sending through an egress proxy.
+- **Downloads:** a limit on the conversions of authenticated downloads, like the one for share
+  links.
+- **Signed URLs:**
+  - a grace period when rotating the key;
+  - several keys per account, each scoped to some images or transformations;
+  - a cap on the variants each image may have;
+  - `f_auto` (choosing the format from `Accept`);
+  - `HEAD` support;
+  - cache tags for targeted CDN purges.
+- **Administration:** an admin API (roles) to replace the operator commands.

@@ -3,9 +3,14 @@ No database."""
 
 import base64
 import hmac
+import json
 import logging
+import random
 import re
+import shutil
+import subprocess
 import uuid
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -16,6 +21,7 @@ from app.routers.downloads import transformation_variant
 from app.schemas import TransformationSpec
 from app.sharing import RedactUrlCredentials, ShareSigner, redact_url_credentials
 from app.signed_urls import (
+    EXTENSIONS,
     KEY_PREFIX,
     InvalidOptions,
     SignedOptions,
@@ -502,3 +508,190 @@ def test_uvicorns_access_lines_are_masked_too():
 
     assert VECTORS[1][1] not in record.getMessage()
     assert f"/signed/{KEY_ID}/[redacted]/w_800%2Ch_600/" in record.getMessage()
+
+
+# --- The README's samples -------------------------------------------------------------------------
+
+README = (Path(__file__).parent.parent / "README.md").read_text()
+URL_PREFIX = f"https://img.example.com/signed/{KEY_ID}/"
+
+
+def readme_sample(language: str) -> str:
+    """The code block after the README's <!-- signed-url-sample {language} --> marker."""
+    match = re.search(
+        rf"<!-- signed-url-sample {language} -->\n```\w+\n(.*?)```", README, re.DOTALL
+    )
+    assert match, f"no {language} sample in the README"
+    return match.group(1)
+
+
+@pytest.fixture(scope="module")
+def python_sample():
+    namespace = {}
+    exec(readme_sample("python"), namespace)
+    return namespace["signed_url"]
+
+
+@pytest.fixture(scope="module")
+def js_sample(tmp_path_factory):
+    """Runs the README's JavaScript sample with Node.js: call it with a list of signedUrl()
+    arguments, and get each call's URL, or "Error: {message}"."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = tmp_path_factory.mktemp("js") / "sample.mjs"
+    script.write_text(
+        readme_sample("js")
+        + """
+import { readFileSync } from "node:fs";
+const calls = JSON.parse(readFileSync(0, "utf8"));
+console.log(JSON.stringify(calls.map((args) => {
+  try { return signedUrl(...args); } catch (error) { return `Error: ${error.message}`; }
+})));
+"""
+    )
+
+    def run(calls: list[list]) -> list[str]:
+        result = subprocess.run(
+            [node, str(script)], input=json.dumps(calls), capture_output=True, text=True, timeout=60
+        )
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    return run
+
+
+def expected_url(image_id: str, image_format: str, transformations: dict, expires) -> str:
+    """The URL the server takes for these transformations: in its own spelling, signed."""
+    spec = TransformationSpec.model_validate(
+        {**{k: v for k, v in transformations.items() if v is not None}, "format": image_format}
+    )
+    options = format_options(spec, expires)
+    extension = "jpg" if image_format == "jpeg" else image_format
+    path = f"{options}/{image_id}.{extension}" if options else f"{image_id}.{extension}"
+    return f"{URL_PREFIX}{sign(KEY, path)}/{path}"
+
+
+SAMPLE_CASES = [
+    ("png", {}, None),
+    ("jpeg", {"quality": 80}, None),
+    ("png", {"quality": 80}, None),  # lossless: q_ is left out
+    ("webp", {"resize": {"width": 800.0, "height": 600.0, "fit": "fill"}}, None),
+    ("webp", {"resize": {"width": 800, "height": None}}, 1_790_000_000),
+    ("gif", {"resize": {"height": 300, "fit": "cover"}}, None),  # fit needs both
+    ("bmp", {"crop": {"width": 10, "height": 20.0}}, None),
+    ("tiff", {"crop": {"x": 5, "width": 10, "height": 20}}, None),
+    ("png", {"rotate": -90}, None),
+    ("png", {"rotate": 360}, None),
+    ("png", {"rotate": -360}, None),
+    ("png", {"rotate": 0}, None),
+    ("png", {"rotate": 12.5}, None),
+    ("png", {"rotate": 0.1 + 0.2}, None),
+    ("png", {"rotate": -0.006}, None),
+    ("png", {"rotate": 359.994}, None),
+    ("png", {"flip": True, "mirror": False}, None),
+    ("png", {"filters": None, "mirror": True}, None),
+    ("png", {"filters": {"blur": 0.1 + 0.2, "sepia": True, "sharpen": False}}, None),
+    ("png", {"filters": {"blur": 50, "grayscale": True, "sharpen": True}}, None),
+    ("jpeg", {"watermark": {"text": "© Alice, a/b_c", "position": "top-left", "opacity": 0.3}}, 1),
+    ("jpeg", {"watermark": {"text": "🐑 ?&=/+", "opacity": 0.57, "size": 8}}, 9_999_999_999),
+    ("webp", {"watermark": {"text": "x" * 100, "position": "bottom-right", "opacity": 0.5}}, None),
+    ("webp", {"watermark": {"text": "Hi", "opacity": 0.29}, "quality": 1}, None),
+    ("webp", {"watermark": {"text": "Hi", "opacity": 0}}, None),
+]
+
+
+def random_cases(count: int) -> list[tuple[str, dict, int | None]]:
+    rng = random.Random(7)
+    cases = []
+    while len(cases) < count:
+        t = {}
+        if rng.random() < 0.3:
+            t["crop"] = {"x": rng.randint(0, 9), "y": rng.randint(0, 9), "width": 5, "height": 7}
+        if rng.random() < 0.4:
+            t["resize"] = {
+                "width": rng.choice([None, 1, 640, 4000]),
+                "height": rng.choice([None, 1, 480]),
+                "fit": rng.choice(["fill", "contain", "cover"]),
+            }
+        if rng.random() < 0.4:
+            t["rotate"] = rng.choice([rng.randint(-360, 360), round(rng.uniform(-360, 360), 6)])
+        for name in ("flip", "mirror"):
+            t[name] = rng.random() < 0.2
+        if rng.random() < 0.4:
+            t["filters"] = {
+                "blur": rng.choice([None, round(rng.uniform(0.01, 50), 4)]),
+                **{name: rng.random() < 0.3 for name in ("sharpen", "grayscale", "sepia")},
+            }
+        if rng.random() < 0.4:
+            t["watermark"] = {
+                "text": rng.choice(["a", "Ünïcødé", "x" * 37]),
+                "position": rng.choice(["top-left", "top-right", "bottom-left", "bottom-right"]),
+                "opacity": rng.randint(0, 100) / 100,
+                "size": rng.choice([None, 8, 500]),
+            }
+        if rng.random() < 0.3:
+            t["quality"] = rng.randint(1, 100)
+        try:
+            expected_url(IMAGE_ID, "png", t, None)
+        except ValidationError:
+            continue
+        cases.append((rng.choice(list(EXTENSIONS.values())), t, rng.choice([None, 1_790_000_000])))
+    return cases
+
+
+def test_the_readme_example_is_what_the_python_sample_gives(python_sample):
+    match = re.search(r"\nsigned_url\((.*?)\n\)\n# (\S+)\n", README, re.DOTALL)
+    assert match, "no example in the README"
+    call, url = match.groups()
+
+    assert eval(f"signed_url({call})", {"signed_url": python_sample}) == url
+    assert url.endswith(f"/{VECTORS[1][1]}/{VECTORS[1][0]}")
+
+
+def test_every_signed_url_in_the_readme_is_valid():
+    signer = UrlSigner(SECRET)
+    urls = re.findall(rf"{re.escape(URL_PREFIX)}[^\s`\"]+", README)
+
+    assert len(urls) >= 2
+    for url in urls:
+        path = signer.verify(KEY_ID, *url.removeprefix(URL_PREFIX).split("/", 1))
+        assert path is not None, url
+        parse_options(path.options, path.format)  # in canonical form
+
+
+@pytest.mark.parametrize(("image_format", "transformations", "expires"), SAMPLE_CASES)
+def test_the_python_sample_spells_options_as_the_server_does(
+    python_sample, image_format, transformations, expires
+):
+    url = python_sample(URL_PREFIX, KEY, IMAGE_ID, image_format, transformations, expires)
+
+    assert url == expected_url(IMAGE_ID, image_format, transformations, expires)
+
+
+def test_the_samples_agree_with_the_server_on_many_transformations(python_sample, js_sample):
+    cases = SAMPLE_CASES + random_cases(300)
+
+    js_urls = js_sample([[URL_PREFIX, KEY, IMAGE_ID, *case] for case in cases])
+
+    for case, js_url in zip(cases, js_urls, strict=True):
+        expected = expected_url(IMAGE_ID, *case)
+        assert python_sample(URL_PREFIX, KEY, IMAGE_ID, *case) == expected, case
+        assert js_url == expected, case
+
+
+@pytest.mark.parametrize(
+    "transformations",
+    [
+        {"rotate": 0.004},
+        {"rotate": -0.004},
+        {"rotate": 359.996},
+        {"filters": {"blur": 0.004}},
+    ],
+)
+def test_the_samples_refuse_what_2_decimals_cannot_write(python_sample, js_sample, transformations):
+    """The server would read such a URL as no rotation or an invalid blur."""
+    with pytest.raises(ValueError, match="2 decimals"):
+        python_sample(URL_PREFIX, KEY, IMAGE_ID, "png", transformations)
+    [js_url] = js_sample([[URL_PREFIX, KEY, IMAGE_ID, "png", transformations, None]])
+    assert js_url.startswith("Error: ") and "2 decimals" in js_url
