@@ -130,6 +130,16 @@ def test_resize_contain_fits_inside_box():
     assert (result.width, result.height) == (40, 20)
 
 
+@pytest.mark.parametrize(("size", "expected"), [((1000, 2), (10, 1)), ((2, 1000), (1, 10))])
+def test_resize_contain_never_makes_an_empty_image(size, expected):
+    """ImageOps.contain would round the short side to 0 pixels, which Pillow can't make."""
+    result = transform(
+        make_image_bytes(size=size), resize={"width": 10, "height": 10, "fit": "contain"}
+    )
+
+    assert (result.width, result.height) == expected
+
+
 def test_resize_cover_fills_box():
     result = transform(
         make_image_bytes(size=(100, 50)), resize={"width": 40, "height": 40, "fit": "cover"}

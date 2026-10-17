@@ -10,9 +10,11 @@ from app.config import Settings
 from app.ratelimit import (
     _SCRIPT,
     KEY_PREFIX,
+    RENDER_KEY_PREFIX,
     UNCHECKED,
     Limit,
     RateLimiter,
+    build_render_rate_limiter,
     build_transform_rate_limiter,
     render_limits,
     transform_limits,
@@ -319,6 +321,28 @@ def test_a_check_counts_nothing(redis_mock, script):
     RateLimiter(redis_mock, (MINUTE, HOUR)).check(USER, cost=3)
 
     script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 3, 0])
+
+
+def test_render_limiters_count_megapixels_under_keys_of_their_own(redis_mock, script):
+    script.return_value = FRESH_REPLY
+
+    build_render_rate_limiter(Settings(_env_file=None), redis_mock).hit(USER, cost=4)
+
+    prefix = f"{RENDER_KEY_PREFIX}:{USER.hex}"
+    script.assert_called_once_with(
+        keys=[f"{prefix}:minute", f"{prefix}:hour"], args=[300, 60, 5000, 3600, 4, 1]
+    )
+
+
+def test_render_limits_without_redis_are_warned_about(caplog):
+    caplog.set_level(logging.WARNING, logger="app.ratelimit")
+
+    limiter = build_render_rate_limiter(Settings(_env_file=None), None)
+
+    assert limiter.hit(USER, cost=5) is UNCHECKED
+    assert [record.getMessage() for record in caplog.records] == [
+        "Signed URL renders are not rate limited: REDIS_URL is not set"
+    ]
 
 
 def test_render_limits_come_from_their_settings():

@@ -321,6 +321,30 @@ def test_a_waiting_owner_gets_its_slot_when_its_render_ends():
     assert order == ["alice done", "alice again", "bob done"]
 
 
+def test_a_freed_slot_goes_to_a_waiter_that_can_take_it():
+    """Alice waits for one of her own slots, Bob for any: when Carol's render ends, Bob must
+    get her slot even though Alice has waited longer."""
+    slots = ConversionSlots(2, max_waiting=4, wait_seconds=3, owner_slots=1, owner_waiting=2)
+    rendered = []
+
+    def waits(owner):
+        with slots.hold(owner):
+            rendered.append(owner)
+
+    alice = threading.Thread(target=waits, args=("alice",))
+    bob = threading.Thread(target=waits, args=("bob",))
+    with slots.hold("alice"):
+        with slots.hold("carol"):
+            alice.start()
+            wait_until_waiting(slots, 1)
+            bob.start()
+            wait_until_waiting(slots, 2)
+        bob.join(1)
+        assert rendered == ["bob"]  # at once, while Alice still waits for her render to end
+    alice.join(5)
+    assert rendered == ["bob", "alice"]
+
+
 # --- Settings -------------------------------------------------------------------------------------
 
 

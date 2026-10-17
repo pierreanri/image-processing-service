@@ -311,7 +311,7 @@ def _decimal(name: str, value: str) -> float:
 
 def _text(value: str) -> str:
     """Watermark text: unpadded base64url of its UTF-8 bytes."""
-    if not _BASE64URL.fullmatch(value) or len(value) % 4 == 1:
+    if not _BASE64URL.fullmatch(value):
         raise InvalidOptions("wm_: expected the text's UTF-8 bytes as unpadded base64url")
     try:
         return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
