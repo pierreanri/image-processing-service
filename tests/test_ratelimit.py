@@ -11,8 +11,10 @@ from app.ratelimit import (
     _SCRIPT,
     KEY_PREFIX,
     UNCHECKED,
+    Limit,
     RateLimiter,
     build_transform_rate_limiter,
+    render_limits,
     transform_limits,
 )
 from tests.utils import HOUR, MINUTE
@@ -53,7 +55,7 @@ def test_hit_runs_one_script_over_every_limit(redis_mock, script):
     hit_with(redis_mock, script, FRESH_REPLY)
 
     redis_mock.register_script.assert_called_once_with(_SCRIPT)
-    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600])
+    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 1, 1])
 
 
 def test_allowed_hit_reports_every_limit(redis_mock, script):
@@ -122,7 +124,7 @@ def test_inconsistent_replies_raise(redis_mock, script, reply):
 def test_only_enabled_limits_are_sent(redis_mock, script):
     decision = hit_with(redis_mock, script, [1, 1, 3_600_000], limits=(HOUR,))
 
-    script.assert_called_once_with(keys=[HOUR_KEY], args=[500, 3600])
+    script.assert_called_once_with(keys=[HOUR_KEY], args=[500, 3600, 1, 1])
     assert decision.headers() == {
         "RateLimit-Policy": '"hour";q=500;w=3600',
         "RateLimit": '"hour";r=499;t=3600',
@@ -277,3 +279,54 @@ def test_disabled_limits_without_redis_are_not_warned_about(caplog):
     build_transform_rate_limiter(settings, None)
 
     assert caplog.records == []
+
+
+# --- Costs and checks (signed URL renders) --------------------------------------------------------
+
+
+def test_a_request_can_cost_more_than_one(redis_mock, script):
+    script.return_value = [1, 12, 33_400, 40, 1_799_001]
+
+    decision = RateLimiter(redis_mock, (MINUTE, HOUR)).hit(USER, cost=7)
+
+    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 7, 1])
+    assert decision.allowed and decision.cost == 7
+
+
+def test_a_rejected_costly_request_names_the_limits_it_would_exceed(redis_mock, script):
+    """5 left of 30 is not enough for 7: the minute limit is exceeded though not used up."""
+    script.return_value = [0, 25, 13_001, 40, 1_799_001]
+
+    decision = RateLimiter(redis_mock, (MINUTE, HOUR)).hit(USER, cost=7)
+
+    assert not decision.allowed
+    assert decision.exceeded == (decision.states[0],)
+    assert decision.retry_after_seconds == 14
+
+
+def test_a_cost_is_capped_at_the_smallest_limit(redis_mock, script):
+    """Otherwise a request costing more than a whole window could never succeed."""
+    script.return_value = FRESH_REPLY
+
+    RateLimiter(redis_mock, (MINUTE, HOUR)).hit(USER, cost=10_000)
+
+    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 30, 1])
+
+
+def test_a_check_counts_nothing(redis_mock, script):
+    script.return_value = FRESH_REPLY
+
+    RateLimiter(redis_mock, (MINUTE, HOUR)).check(USER, cost=3)
+
+    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 3, 0])
+
+
+def test_render_limits_come_from_their_settings():
+    settings = Settings(
+        _env_file=None,
+        jwt_secret="x" * 32,
+        signed_url_render_megapixels_per_minute=0,
+        signed_url_render_megapixels_per_hour=900,
+    )
+
+    assert render_limits(settings) == (Limit("hour", 900, 3600),)

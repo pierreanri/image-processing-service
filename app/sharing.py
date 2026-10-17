@@ -20,7 +20,8 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections import Counter
+from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -108,12 +109,16 @@ class ConversionsBusyError(Exception):
 
 
 class ConversionSlots:
-    """Bounds the conversions that downloads through share links run at once in this process.
-    Anyone holding a link can make the API convert its image whenever that variant isn't cached
-    (Redis down, or larger than CACHE_MAX_ITEM_BYTES), and an embedded link has many viewers.
+    """Bounds the conversions (and renders) that public downloads run at once in this process:
+    share links' and signed URLs', each with its own slots. Anyone holding such a URL can make
+    the API convert its image whenever that variant isn't cached (Redis down, or larger than
+    CACHE_MAX_ITEM_BYTES), and an embedded URL has many viewers.
 
     A request without a free slot waits up to `wait_seconds` for one, but only `max_waiting` may
-    wait at a time (each holds one of the API's worker threads); the others fail at once.
+    wait at a time (each holds one of the API's worker threads); the others fail at once. With
+    `owner_slots`, one owner (an account) holds at most that many slots and has at most
+    `owner_waiting` requests waiting, so one account's renders can't take every slot from the
+    others.
     """
 
     def __init__(
@@ -122,33 +127,66 @@ class ConversionSlots:
         *,
         max_waiting: int | None = None,
         wait_seconds: float = CONVERSION_WAIT_SECONDS,
+        owner_slots: int | None = None,
+        owner_waiting: int | None = None,
     ) -> None:
-        self._slots = threading.BoundedSemaphore(slots)
+        self._slots = slots
         self._max_waiting = slots if max_waiting is None else max_waiting
         self._wait_seconds = wait_seconds
+        self._owner_slots = owner_slots
+        self._owner_waiting = slots if owner_waiting is None else owner_waiting
+        self._condition = threading.Condition()
+        self._held = 0
         self._waiting = 0
-        self._lock = threading.Lock()
+        self._held_by: Counter[Hashable] = Counter()
+        self._waiting_by: Counter[Hashable] = Counter()
 
     @contextmanager
-    def hold(self) -> Iterator[None]:
-        """Hold a slot for the duration of the block. Raises ConversionsBusyError if none frees
-        up in time."""
-        if not self._slots.acquire(blocking=False):
-            with self._lock:
-                if self._waiting >= self._max_waiting:
+    def hold(self, owner: Hashable | None = None) -> Iterator[None]:
+        """Hold a slot (one of `owner`'s) for the duration of the block. Raises
+        ConversionsBusyError if none frees up in time."""
+        owned = owner is not None and self._owner_slots is not None
+        with self._condition:
+            if not self._free(owner, owned):
+                if self._waiting >= self._max_waiting or (
+                    owned and self._waiting_by[owner] >= self._owner_waiting
+                ):
                     raise ConversionsBusyError
                 self._waiting += 1
-            try:
-                acquired = self._slots.acquire(timeout=self._wait_seconds)
-            finally:
-                with self._lock:
+                if owned:
+                    self._waiting_by[owner] += 1
+                try:
+                    acquired = self._condition.wait_for(
+                        lambda: self._free(owner, owned), timeout=self._wait_seconds
+                    )
+                finally:
                     self._waiting -= 1
-            if not acquired:
-                raise ConversionsBusyError
+                    if owned:
+                        _decrement(self._waiting_by, owner)
+                if not acquired:
+                    raise ConversionsBusyError
+            self._held += 1
+            if owned:
+                self._held_by[owner] += 1
         try:
             yield
         finally:
-            self._slots.release()
+            with self._condition:
+                self._held -= 1
+                if owned:
+                    _decrement(self._held_by, owner)
+                # Waiters wait for different things (any slot, or one of their owner's).
+                self._condition.notify_all()
+
+    def _free(self, owner: Hashable | None, owned: bool) -> bool:
+        return self._held < self._slots and (not owned or self._held_by[owner] < self._owner_slots)
+
+
+def _decrement(counter: Counter[Hashable], owner: Hashable) -> None:
+    # Owners at zero are dropped, or every account that ever rendered would stay in memory.
+    counter[owner] -= 1
+    if not counter[owner]:
+        del counter[owner]
 
 
 @lru_cache
@@ -156,32 +194,36 @@ def get_share_conversion_slots() -> ConversionSlots:
     return ConversionSlots(get_settings().share_max_concurrent_conversions)
 
 
-# A share link in a URL path: its payload (kept, it helps debugging) and the rest (masked).
-_SHARE_PATH = re.compile(r"(/shared/[A-Za-z0-9_-]{36})[A-Za-z0-9_-]+")
+# The credential in a share link's or a signed URL's path: a share link's payload and a signed
+# URL's key id are kept (they help debugging and support), the rest of the token and the
+# signature are masked.
+_URL_CREDENTIALS = re.compile(
+    r"(/shared/[A-Za-z0-9_-]{36}|/signed/[A-Za-z0-9_-]{16}/)[A-Za-z0-9_-]+"
+)
 
 
-def redact_share_tokens(text: str) -> str:
-    """`text` with the secret part of any share link in it masked."""
-    return _SHARE_PATH.sub(r"\1[redacted]", text)
+def redact_url_credentials(text: str) -> str:
+    """`text` with the secret part of any share link or signed URL in it masked."""
+    return _URL_CREDENTIALS.sub(r"\1[redacted]", text)
 
 
-class RedactShareTokens(logging.Filter):
-    """Masks share links in log records, such as uvicorn's access log lines."""
+class RedactUrlCredentials(logging.Filter):
+    """Masks share links and signed URLs in log records, such as uvicorn's access log lines."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
-            record.msg = redact_share_tokens(record.msg)
+            record.msg = redact_url_credentials(record.msg)
         if isinstance(record.args, tuple):
             record.args = tuple(
-                redact_share_tokens(arg) if isinstance(arg, str) else arg for arg in record.args
+                redact_url_credentials(arg) if isinstance(arg, str) else arg for arg in record.args
             )
         elif isinstance(record.args, dict):
             record.args = {
-                key: redact_share_tokens(arg) if isinstance(arg, str) else arg
+                key: redact_url_credentials(arg) if isinstance(arg, str) else arg
                 for key, arg in record.args.items()
             }
         return True
 
 
 # Installed on uvicorn's access logger at startup (app/main.py).
-ACCESS_LOG_FILTER = RedactShareTokens()
+ACCESS_LOG_FILTER = RedactUrlCredentials()

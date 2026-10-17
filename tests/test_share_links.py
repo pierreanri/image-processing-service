@@ -5,10 +5,8 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 import pytest
-from sqlalchemy import event
 
 from app.config import get_settings
-from app.db import get_sessionmaker
 from app.main import app
 from app.routers.shared import MAX_AGE_SECONDS
 from app.sharing import (
@@ -18,7 +16,14 @@ from app.sharing import (
     get_share_signer,
 )
 from app.storage import CHUNK_SIZE, StorageUnavailableError
-from tests.utils import make_image_bytes, register, share, stored_keys, user_id_of
+from tests.utils import (
+    count_statements,
+    make_image_bytes,
+    register,
+    share,
+    stored_keys,
+    user_id_of,
+)
 
 NOW = 1_790_000_000.0
 DAY = 24 * 60 * 60
@@ -60,18 +65,6 @@ def expires_at(seconds: float) -> str:
 
 def token_of(url: str) -> str:
     return url.rsplit("/", 1)[1].split(".")[0]
-
-
-def count_statements():
-    """Counts the SQL statements run from here on: call the result to read the count."""
-    statements = []
-    engine = get_sessionmaker().kw["bind"]
-
-    def count(conn, cursor, statement, parameters, context, executemany):
-        statements.append(statement)
-
-    event.listen(engine, "before_cursor_execute", count)
-    return lambda: (event.remove(engine, "before_cursor_execute", count), len(statements))[1]
 
 
 # --- Creating links -------------------------------------------------------------------------------
@@ -575,10 +568,10 @@ def test_a_conversion_that_waited_uses_what_was_cached_meanwhile(
     image_id = uuid.UUID(image["id"])
 
     class FinishesAnotherConversionFirst(ConversionSlots):
-        def hold(self):
+        def hold(self, *args):
             # Another request converted the same variant while this one waited.
             variant_cache.set(image_id, "webp-qdefault", b"converted meanwhile")
-            return super().hold()
+            return super().hold(*args)
 
     app.dependency_overrides[get_share_conversion_slots] = lambda: FinishesAnotherConversionFirst(1)
     storage.read = lambda key: pytest.fail("the variant must not be converted again")

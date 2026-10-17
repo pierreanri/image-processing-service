@@ -4,6 +4,7 @@ This module has no web or database dependencies so it can be tested (and reused)
 """
 
 import io
+import math
 import warnings
 from dataclasses import dataclass
 
@@ -125,14 +126,13 @@ def apply_transformations(
     Order: crop, resize, rotate, flip, mirror, filters, watermark, then encode.
     """
     image = _normalize_mode(loaded.image)
+    image_format = spec.format or loaded.format
+    # Refuses what would fail on its size before allocating anything for it: a rotation's
+    # expanded canvas alone can take gigabytes.
+    predict_output_size(image.width, image.height, spec, image_format, max_dimension)
 
     if spec.crop is not None:
         crop = spec.crop
-        if crop.x + crop.width > image.width or crop.y + crop.height > image.height:
-            raise TransformationError(
-                f"Crop area ({crop.x},{crop.y},{crop.width}x{crop.height}) is outside the "
-                f"{image.width}x{image.height} image"
-            )
         image = image.crop((crop.x, crop.y, crop.x + crop.width, crop.y + crop.height))
 
     if spec.resize is not None:
@@ -153,15 +153,35 @@ def apply_transformations(
     if spec.watermark is not None:
         image = _watermark(image, spec.watermark)
 
-    image_format = spec.format or loaded.format
-    limit = max_output_dimension(image_format, max_dimension)
-    if image.width > limit or image.height > limit:
-        raise TransformationError(
-            f"Resulting image {image.width}x{image.height} exceeds the maximum dimension "
-            f"of {limit}px" + ("" if limit == max_dimension else f" for {image_format}")
-        )
-
     return encode_image(image, image_format, spec.quality)
+
+
+def predict_output_size(
+    width: int, height: int, spec: TransformationSpec, image_format: str, max_dimension: int
+) -> tuple[int, int]:
+    """The size of what apply_transformations makes of a `width`x`height` image in
+    `image_format`, or the TransformationError it raises for the size of its steps (crop,
+    resize, the result), computed without touching a pixel."""
+    if spec.crop is not None:
+        crop = spec.crop
+        if crop.x + crop.width > width or crop.y + crop.height > height:
+            raise TransformationError(
+                f"Crop area ({crop.x},{crop.y},{crop.width}x{crop.height}) is outside the "
+                f"{width}x{height} image"
+            )
+        width, height = crop.width, crop.height
+    if spec.resize is not None:
+        width, height = _resized_size(width, height, spec.resize, max_dimension)
+    if spec.rotate:
+        width, height = _rotated_size(width, height, spec.rotate)
+    # Flips, filters and watermarks keep the size.
+    limit = max_output_dimension(image_format, max_dimension)
+    if width > limit or height > limit:
+        raise TransformationError(
+            f"Resulting image {width}x{height} exceeds the maximum dimension of {limit}px"
+            + ("" if limit == max_dimension else f" for {image_format}")
+        )
+    return width, height
 
 
 def encode_image(image: Image.Image, image_format: str, quality: int | None = None) -> EncodedImage:
@@ -212,24 +232,62 @@ def _flatten(image: Image.Image) -> Image.Image:
 
 
 def _resize(image: Image.Image, spec: ResizeSpec, max_dimension: int) -> Image.Image:
-    width, height = spec.width, spec.height
-    if width is None:
-        width = max(1, round(image.width * height / image.height))
-    elif height is None:
-        height = max(1, round(image.height * width / image.width))
-
-    if width > max_dimension or height > max_dimension:
-        raise TransformationError(
-            f"Resize to {width}x{height} exceeds the maximum dimension of {max_dimension}px"
-        )
-
-    size = (width, height)
-    both_given = spec.width is not None and spec.height is not None
-    if both_given and spec.fit == "contain":
-        return ImageOps.contain(image, size, method=Image.Resampling.LANCZOS)
-    if both_given and spec.fit == "cover":
+    size = _resized_size(image.width, image.height, spec, max_dimension)
+    if spec.width is not None and spec.height is not None and spec.fit == "cover":
         return ImageOps.fit(image, size, method=Image.Resampling.LANCZOS)
     return image.resize(size, Image.Resampling.LANCZOS)
+
+
+def _resize_target(
+    width: int, height: int, spec: ResizeSpec, max_dimension: int
+) -> tuple[int, int]:
+    """The box a resize of a `width`x`height` image aims at."""
+    target_width, target_height = spec.width, spec.height
+    if target_width is None:
+        target_width = max(1, round(width * target_height / height))
+    elif target_height is None:
+        target_height = max(1, round(height * target_width / width))
+    if target_width > max_dimension or target_height > max_dimension:
+        raise TransformationError(
+            f"Resize to {target_width}x{target_height} exceeds the maximum dimension of "
+            f"{max_dimension}px"
+        )
+    return target_width, target_height
+
+
+def _resized_size(width: int, height: int, spec: ResizeSpec, max_dimension: int) -> tuple[int, int]:
+    """The size _resize gives a `width`x`height` image."""
+    size = _resize_target(width, height, spec, max_dimension)
+    if spec.width is None or spec.height is None or spec.fit != "contain":
+        return size
+    # As ImageOps.contain computes it, but never 0 pixels (for a very wide or tall image).
+    image_ratio, box_ratio = width / height, size[0] / size[1]
+    if image_ratio > box_ratio:
+        return size[0], max(1, round(height / width * size[0]))
+    if image_ratio < box_ratio:
+        return max(1, round(width / height * size[1])), size[1]
+    return size
+
+
+def _rotated_size(width: int, height: int, degrees: float) -> tuple[int, int]:
+    """The size _rotate gives a `width`x`height` image: the bounding box of its rotated corners,
+    computed exactly as Image.rotate(expand=True) does."""
+    angle = -degrees % 360
+    if angle % 90 == 0:
+        return (height, width) if angle % 180 == 90 else (width, height)
+    radians = -math.radians(angle % 360.0)
+    a, b = round(math.cos(radians), 15), round(math.sin(radians), 15)
+    d, e = round(-math.sin(radians), 15), round(math.cos(radians), 15)
+    center_x, center_y = width / 2, height / 2
+    c = a * -center_x + b * -center_y + 0.0 + center_x
+    f = d * -center_x + e * -center_y + 0.0 + center_y
+    corners = ((0, 0), (width, 0), (width, height), (0, height))
+    xs = [a * x + b * y + c for x, y in corners]
+    ys = [d * x + e * y + f for x, y in corners]
+    return (
+        math.ceil(max(xs)) - math.floor(min(xs)),
+        math.ceil(max(ys)) - math.floor(min(ys)),
+    )
 
 
 def _rotate(image: Image.Image, degrees: float) -> Image.Image:

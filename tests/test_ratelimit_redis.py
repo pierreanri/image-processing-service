@@ -15,6 +15,7 @@ import pytest
 from app.main import app
 from app.ratelimit import (
     KEY_PREFIX,
+    RENDER_KEY_PREFIX,
     Limit,
     RateLimitDecision,
     RateLimiter,
@@ -176,3 +177,54 @@ def test_transform_endpoint_is_limited_end_to_end(client, auth_headers, endpoint
         f"Too many transformations (limit: 2 per minute); retry in {retry_after}s"
     )
     assert client.get("/images", headers=auth_headers).json()["total"] == 3
+
+
+# --- Costs, checks, render limits -----------------------------------------------------------------
+
+
+def render_keys_of(user_id: uuid.UUID) -> tuple[str, str]:
+    return f"{RENDER_KEY_PREFIX}:{user_id.hex}:minute", f"{RENDER_KEY_PREFIX}:{user_id.hex}:hour"
+
+
+def test_costs_count_until_the_next_one_would_not_fit(redis_client, new_user_id):
+    user_id = new_user_id()
+    limiter = RateLimiter(redis_client, (Limit("minute", 10, 60),))
+
+    assert checked(limiter.hit(user_id, cost=4)).allowed
+    assert checked(limiter.hit(user_id, cost=4)).allowed
+    rejected = checked(limiter.hit(user_id, cost=4))
+
+    assert not rejected.allowed
+    assert rejected.states[0].remaining == 2
+    assert rejected.retry_after_seconds is not None
+    assert redis_client.get(keys_of(user_id)[0]) == b"8"
+    assert checked(limiter.hit(user_id, cost=2)).allowed
+    assert redis_client.get(keys_of(user_id)[0]) == b"10"
+
+
+def test_checks_count_nothing(redis_client, new_user_id):
+    user_id = new_user_id()
+    limiter = RateLimiter(redis_client, (Limit("minute", 10, 60),))
+
+    assert checked(limiter.check(user_id, cost=10)).allowed
+    assert redis_client.exists(keys_of(user_id)[0]) == 0
+    limiter.hit(user_id, cost=9)
+    assert not checked(limiter.check(user_id, cost=2)).allowed
+    assert redis_client.get(keys_of(user_id)[0]) == b"9"
+
+
+def test_render_limits_count_apart_from_transform_limits(redis_client, new_user_id):
+    user_id = new_user_id()
+    renders = RateLimiter(
+        redis_client,
+        (Limit("minute", 300, 60), Limit("hour", 5000, 3600)),
+        key_prefix=RENDER_KEY_PREFIX,
+    )
+    try:
+        assert checked(renders.hit(user_id, cost=25)).allowed
+
+        assert redis_client.get(render_keys_of(user_id)[0]) == b"25"
+        assert redis_client.get(render_keys_of(user_id)[1]) == b"25"
+        assert redis_client.exists(*keys_of(user_id)) == 0
+    finally:
+        redis_client.unlink(*render_keys_of(user_id))

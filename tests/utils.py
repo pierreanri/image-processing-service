@@ -11,7 +11,7 @@ from pathlib import Path
 import jwt
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import select, text, update
+from sqlalchemy import event, select, text, update
 
 from app.db import get_sessionmaker
 from app.models import WebhookDelivery, WebhookEndpoint
@@ -90,15 +90,22 @@ REJECTED = RateLimitDecision(False, (LimitState(MINUTE, 0, 13), LimitState(HOUR,
 
 
 class FakeRateLimiter:
-    """Stand-in for app.ratelimit.RateLimiter that records who was counted and returns a
-    canned decision."""
+    """Stand-in for app.ratelimit.RateLimiter that records who was counted (and checked), and
+    at what cost, and returns a canned decision."""
 
     def __init__(self, decision: RateLimitDecision = UNCHECKED) -> None:
         self.decision = decision
         self.hits: list[uuid.UUID] = []
+        self.costs: list[int] = []
+        self.checks: list[tuple[uuid.UUID, int]] = []
 
-    def hit(self, user_id: uuid.UUID) -> RateLimitDecision:
+    def hit(self, user_id: uuid.UUID, cost: int = 1) -> RateLimitDecision:
         self.hits.append(user_id)
+        self.costs.append(cost)
+        return self.decision
+
+    def check(self, user_id: uuid.UUID, cost: int = 1) -> RateLimitDecision:
+        self.checks.append((user_id, cost))
         return self.decision
 
 
@@ -307,3 +314,15 @@ def create_url_signing_key(client: TestClient, headers: dict) -> dict:
     response = client.post("/me/url-signing-key", headers=headers)
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def count_statements():
+    """Counts the SQL statements run from here on: call the result to read the count."""
+    statements = []
+    engine = get_sessionmaker().kw["bind"]
+
+    def count(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", count)
+    return lambda: (event.remove(engine, "before_cursor_execute", count), len(statements))[1]

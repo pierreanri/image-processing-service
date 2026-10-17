@@ -18,10 +18,10 @@ from app.sharing import (
     FORMAT_CODES,
     ConversionsBusyError,
     ConversionSlots,
-    RedactShareTokens,
+    RedactUrlCredentials,
     ShareLink,
     ShareSigner,
-    redact_share_tokens,
+    redact_url_credentials,
 )
 
 SECRET = "test-secret-that-is-at-least-32-characters-long"
@@ -157,12 +157,12 @@ def test_redaction_keeps_the_payload_and_masks_the_tag(signer):
     token = signer.sign(a_link())
     path = f"/shared/{token}.webp?fbclid=abc"
 
-    redacted = redact_share_tokens(f"GET {path} HTTP/1.1")
+    redacted = redact_url_credentials(f"GET {path} HTTP/1.1")
 
     assert redacted == f"GET /shared/{token[:36]}[redacted].webp?fbclid=abc HTTP/1.1"
     assert token[36:] not in redacted
     for untouched in ("/images/abc/content", "/shared/short.png", f"/shared/{token[:36]}.png"):
-        assert redact_share_tokens(untouched) == untouched
+        assert redact_url_credentials(untouched) == untouched
 
 
 def test_the_access_log_filter_masks_share_links(signer):
@@ -178,7 +178,7 @@ def test_the_access_log_filter_masks_share_links(signer):
         None,
     )
 
-    assert RedactShareTokens().filter(record) is True
+    assert RedactUrlCredentials().filter(record) is True
     line = AccessFormatter(use_colors=False).format(record)
 
     assert f"/shared/{token[:36]}[redacted].webp" in line
@@ -248,6 +248,77 @@ def test_a_request_gives_up_after_waiting_for_a_slot():
         pass
 
     assert slots._waiting == 0
+
+
+def wait_until_waiting(slots: ConversionSlots, count: int) -> None:
+    deadline = time.monotonic() + 5
+    while slots._waiting < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert slots._waiting == count
+
+
+def test_one_owner_holds_at_most_its_share_of_slots():
+    slots = ConversionSlots(2, max_waiting=4, wait_seconds=0.05, owner_slots=1, owner_waiting=2)
+
+    with slots.hold("alice"):
+        # Alice's second render waits for her own slot, even though one is free...
+        started = time.monotonic()
+        with pytest.raises(ConversionsBusyError), slots.hold("alice"):
+            pass
+        assert time.monotonic() - started >= 0.05
+        # ...which Bob gets at once.
+        with slots.hold("bob"):
+            pass
+        # Requests without an owner are only bound by the total.
+        with slots.hold():
+            pass
+
+
+def test_one_owner_has_at_most_so_many_requests_waiting():
+    slots = ConversionSlots(2, max_waiting=4, wait_seconds=10, owner_slots=1, owner_waiting=1)
+    done = threading.Event()
+
+    def alice_waits():
+        with slots.hold("alice"):
+            done.set()
+
+    with slots.hold("alice"):
+        waiter = threading.Thread(target=alice_waits)
+        waiter.start()
+        wait_until_waiting(slots, 1)
+
+        started = time.monotonic()
+        with pytest.raises(ConversionsBusyError), slots.hold("alice"):
+            pass
+        assert time.monotonic() - started < 1  # turned away at once
+        with slots.hold("bob"):  # the room is not full for others
+            pass
+
+    waiter.join(5)
+    assert done.is_set()
+    # Nothing is kept for owners with nothing held or waiting.
+    assert (slots._waiting, slots._held) == (0, 0)
+    assert not slots._waiting_by and not slots._held_by
+
+
+def test_a_waiting_owner_gets_its_slot_when_its_render_ends():
+    slots = ConversionSlots(2, max_waiting=4, wait_seconds=10, owner_slots=1, owner_waiting=2)
+    order = []
+
+    def alice_waits():
+        with slots.hold("alice"):
+            order.append("alice again")
+
+    with slots.hold("bob"):
+        with slots.hold("alice"):
+            waiter = threading.Thread(target=alice_waits)
+            waiter.start()
+            wait_until_waiting(slots, 1)
+            order.append("alice done")
+        waiter.join(5)
+        order.append("bob done")
+
+    assert order == ["alice done", "alice again", "bob done"]
 
 
 # --- Settings -------------------------------------------------------------------------------------

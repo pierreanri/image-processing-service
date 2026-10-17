@@ -1,8 +1,10 @@
-"""Per-user rate limits on transformations, counted in Redis.
+"""Per-user rate limits, counted in Redis: on transformations, and on the renders of signed URLs
+(counted in megapixels).
 
 Each limit is a fixed window that starts with a user's first counted request and ends when its
 Redis key expires, so every API instance agrees on it. One Lua script checks every limit and
-counts the request against all of them or, if any is used up, against none.
+counts the request (its cost: 1, or its megapixels) against all of them or, if any would be
+exceeded, against none.
 
 Like the conversion cache, the limiter fails open: while Redis is unreachable or slow (or
 REDIS_URL is empty) requests are allowed without being counted.
@@ -25,21 +27,26 @@ logger = logging.getLogger(__name__)
 
 # Bump the version if the counting semantics change.
 KEY_PREFIX = "imgsvc:ratelimit:v1:transform"
+RENDER_KEY_PREFIX = "imgsvc:ratelimit:v1:render"
 
 # KEYS[i] counts one user's requests in the current window of limit i, which allows ARGV[2i-1]
-# requests per ARGV[2i] seconds. Returns {allowed (1 or 0), count_1, pttl_ms_1, count_2, ...}.
+# per ARGV[2i] seconds. The request costs ARGV[2n+1], and is counted unless ARGV[2n+2] is "0"
+# (a check). Returns {allowed (1 or 0), count_1, pttl_ms_1, count_2, ...}.
 _SCRIPT = """
+local n = #KEYS
+local cost = tonumber(ARGV[2 * n + 1])
+local count = ARGV[2 * n + 2] ~= '0'
 local counts, allowed = {}, 1
 for i, key in ipairs(KEYS) do
     counts[i] = tonumber(redis.call('GET', key) or '0')
-    if counts[i] >= tonumber(ARGV[2 * i - 1]) then
+    if counts[i] + cost > tonumber(ARGV[2 * i - 1]) then
         allowed = 0
     end
 end
 local reply = {allowed}
 for i, key in ipairs(KEYS) do
-    if allowed == 1 then
-        counts[i] = redis.call('INCR', key)
+    if allowed == 1 and count then
+        counts[i] = redis.call('INCRBY', key, cost)
     end
     local ttl = redis.call('PTTL', key)
     if ttl == -1 then
@@ -74,12 +81,14 @@ class RateLimitDecision:
     allowed: bool
     # Empty when the limits were not checked (no Redis, no limits, or Redis unavailable).
     states: tuple[LimitState, ...] = ()
+    # What the request cost, or would have.
+    cost: int = 1
 
     @property
     def exceeded(self) -> tuple[LimitState, ...]:
         if self.allowed:
             return ()
-        return tuple(state for state in self.states if state.remaining == 0)
+        return tuple(state for state in self.states if state.remaining < self.cost)
 
     @property
     def retry_after_seconds(self) -> int | None:
@@ -117,42 +126,53 @@ class RateLimiter:
         client: redis.Redis | None,
         limits: Sequence[Limit],
         *,
+        key_prefix: str = KEY_PREFIX,
+        feature: str = "Transform rate limiter",
+        consequence: str = "transformations are not rate limited",
         cooldown_seconds: float = COOLDOWN_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._limits = tuple(limits)
+        self._key_prefix = key_prefix
         # Only hashes the script locally; redis-py loads it into Redis on first use.
         self._script = (
             client.register_script(_SCRIPT) if client is not None and self._limits else None
         )
         self._args = [n for limit in self._limits for n in (limit.requests, limit.window_seconds)]
+        # A request costing more than a whole window still gets through once per window.
+        self._max_cost = min((limit.requests for limit in self._limits), default=1)
         self._outage = RedisOutage(
-            logger,
-            "Transform rate limiter",
-            "transformations are not rate limited",
-            cooldown_seconds=cooldown_seconds,
-            clock=clock,
+            logger, feature, consequence, cooldown_seconds=cooldown_seconds, clock=clock
         )
 
-    def hit(self, user_id: uuid.UUID) -> RateLimitDecision:
-        """Count one request by `user_id`, unless a limit is used up."""
+    def hit(self, user_id: uuid.UUID, cost: int = 1) -> RateLimitDecision:
+        """Count a request by `user_id` costing `cost`, unless that would exceed a limit."""
+        return self._run(user_id, cost, count=True)
+
+    def check(self, user_id: uuid.UUID, cost: int = 1) -> RateLimitDecision:
+        """Whether a request by `user_id` costing `cost` would be allowed now, counting
+        nothing."""
+        return self._run(user_id, cost, count=False)
+
+    def _run(self, user_id: uuid.UUID, cost: int, *, count: bool) -> RateLimitDecision:
         if self._script is None or not self._outage.usable():
             return UNCHECKED
-        keys = [f"{KEY_PREFIX}:{user_id.hex}:{limit.name}" for limit in self._limits]
+        cost = min(max(cost, 1), self._max_cost)
+        keys = [f"{self._key_prefix}:{user_id.hex}:{limit.name}" for limit in self._limits]
         started = self._outage.now()
         try:
-            reply = self._script(keys=keys, args=self._args)
+            reply = self._script(keys=keys, args=[*self._args, cost, int(count)])
         except redis.RedisError as exc:
             self._outage.failed(exc)
             return UNCHECKED
-        decision = self._decision(reply)
-        # Only a counted request proves Redis accepts writes again: a rejection runs just
-        # GET and PTTL, which a full (noeviction) or read-only Redis still answers.
-        if decision.allowed:
+        decision = self._decision(reply, cost)
+        # Only a counted request proves Redis accepts writes again: a rejection (or a check)
+        # runs just GET and PTTL, which a full (noeviction) or read-only Redis still answers.
+        if decision.allowed and count:
             self._outage.recovered(started)
         return decision
 
-    def _decision(self, reply: list[int]) -> RateLimitDecision:
+    def _decision(self, reply: list[int], cost: int) -> RateLimitDecision:
         allowed, *counters = reply
         states = tuple(
             LimitState(limit, max(limit.requests - count, 0), _reset_seconds(pttl_ms, limit))
@@ -160,7 +180,7 @@ class RateLimiter:
                 self._limits, counters[::2], counters[1::2], strict=True
             )
         )
-        decision = RateLimitDecision(allowed == 1, states)
+        decision = RateLimitDecision(allowed == 1, states, cost)
         if not decision.allowed and not decision.exceeded:
             raise ValueError(f"Rejected without a used-up limit: {reply!r}")
         return decision
@@ -191,3 +211,30 @@ def build_transform_rate_limiter(settings: Settings, client: redis.Redis | None)
 @lru_cache
 def get_transform_rate_limiter() -> RateLimiter:
     return build_transform_rate_limiter(get_settings(), get_redis_client())
+
+
+def render_limits(settings: Settings) -> tuple[Limit, ...]:
+    limits = (
+        Limit("minute", settings.signed_url_render_megapixels_per_minute, 60),
+        Limit("hour", settings.signed_url_render_megapixels_per_hour, 60 * 60),
+    )
+    return tuple(limit for limit in limits if limit.requests > 0)
+
+
+def build_render_rate_limiter(settings: Settings, client: redis.Redis | None) -> RateLimiter:
+    """Limits the megapixels each account's signed URLs may render."""
+    limits = render_limits(settings)
+    if limits and client is None:
+        logger.warning("Signed URL renders are not rate limited: REDIS_URL is not set")
+    return RateLimiter(
+        client,
+        limits,
+        key_prefix=RENDER_KEY_PREFIX,
+        feature="Signed URL render limiter",
+        consequence="signed URL renders are not rate limited",
+    )
+
+
+@lru_cache
+def get_render_rate_limiter() -> RateLimiter:
+    return build_render_rate_limiter(get_settings(), get_redis_client())

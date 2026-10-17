@@ -1,7 +1,12 @@
-"""Sending an image's bytes, as stored or converted: shared by GET /images/{id}/content and
-GET /shared/{token}.{ext} (share links)."""
+"""Sending an image's bytes, as stored, converted or transformed: shared by
+GET /images/{id}/content, GET /shared/{token}.{ext} (share links) and GET /signed/... (signed
+URLs)."""
 
+import hashlib
+from collections.abc import Hashable
+from dataclasses import dataclass
 from email.utils import formatdate
+from typing import Protocol
 
 from fastapi import Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -16,6 +21,28 @@ from app.schemas import TransformationSpec
 from app.sharing import ConversionSlots
 from app.storage import FileStream, Storage
 from app.transforms import release_connection
+
+
+@dataclass(frozen=True)
+class Variant:
+    """What a download serves: the stored file (token None), or `spec` applied to it."""
+
+    # The ETag suffix and the variant cache's field; None for the stored file.
+    token: str | None
+    spec: TransformationSpec | None
+
+
+class RenderGate(Protocol):
+    """Decides whether a render (a variant not in the cache) may run, and for whom."""
+
+    # Whose slots it takes (see ConversionSlots).
+    owner: Hashable
+
+    def admit(self) -> None:
+        """Before waiting for a slot: raise if no render may start now, counting nothing."""
+
+    def charge(self) -> None:
+        """Right before rendering: count the render, or raise."""
 
 
 def image_variant(
@@ -34,11 +61,42 @@ def image_variant(
     return target_format, effective_quality, f"{target_format}-q{effective_quality or 'default'}"
 
 
+def conversion(stored_format: str, format: str | None, quality: int | None) -> Variant:
+    """The variant a download asking for `format` and `quality` serves (see image_variant)."""
+    target_format, effective_quality, token = image_variant(stored_format, format, quality)
+    if token is None:
+        return Variant(None, None)
+    return Variant(token, TransformationSpec(format=target_format, quality=effective_quality))
+
+
+def transformation_variant(
+    stored_format: str, spec: TransformationSpec, transformations: str
+) -> Variant:
+    """The variant `spec` (its format always set) describes; `transformations` is its one
+    canonical spelling (a signed URL's options without the expiry)."""
+    if not spec.model_dump(exclude_defaults=True, exclude={"format", "quality"}):
+        # Only a format and a quality: the same variant as /content's and share links'.
+        return conversion(stored_format, spec.format, spec.quality)
+    # Fixed length, whatever the watermark's; apart from conversions' "-q" tokens.
+    digest = hashlib.sha256(transformations.encode()).hexdigest()[:32]
+    return Variant(f"{spec.format}-t{digest}", spec)
+
+
 def send_image(
     request: Request,
     image: Image,
     format: str | None,
     quality: int | None,
+    **kwargs,
+) -> Response:
+    """Answer a download of `image` converted to `format`/`quality` (see send_variant)."""
+    return send_variant(request, image, conversion(image.format, format, quality), **kwargs)
+
+
+def send_variant(
+    request: Request,
+    image: Image,
+    variant: Variant,
     *,
     headers: dict[str, str],
     db: Session,
@@ -46,55 +104,48 @@ def send_image(
     settings: Settings,
     cache: VariantCache,
     conversion_slots: ConversionSlots | None = None,
+    gate: RenderGate | None = None,
 ) -> Response:
     """Answer a download of `image`, which the caller has authorized: 304 when If-None-Match
-    matches, else the stored file streamed, or its conversion to `format`/`quality` from the
-    cache or made now (in one of `conversion_slots`, if given). `headers` go on every
-    response."""
-    target_format, effective_quality, variant = image_variant(image.format, format, quality)
-    etag = f'"{image.id.hex}"' if variant is None else f'"{image.id.hex}-{variant}"'
+    matches, else the stored file streamed, or the variant from the cache or rendered now (in one
+    of `conversion_slots`, if given, as `gate` allows). `headers` go on every response."""
+    etag = f'"{image.id.hex}"' if variant.token is None else f'"{image.id.hex}-{variant.token}"'
     # The type always comes from the format detected on upload; browsers must not guess another.
     headers = {**headers, "ETag": etag, "X-Content-Type-Options": "nosniff"}
     if _etag_matches(request.headers.get("if-none-match"), etag):
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     release_connection(db)
 
-    if variant is None:
+    if variant.token is None:
         headers["Last-Modified"] = formatdate(image.created_at.timestamp(), usegmt=True)
         return _StoredFileResponse(
             storage.open(image.storage_key), media_type=image.mime_type, headers=headers
         )
 
-    data = cache.get(image.id, variant)
+    data = cache.get(image.id, variant.token)
     if data is None and conversion_slots is None:
-        data = _convert(image, target_format, effective_quality, variant, storage, settings, cache)
+        if gate is not None:
+            gate.charge()
+        data = _render(image, variant, storage, settings, cache)
     elif data is None:
-        with conversion_slots.hold():
+        if gate is not None:
+            gate.admit()
+        with conversion_slots.hold(None if gate is None else gate.owner):
             # A request this one waited for may have just cached the same variant.
-            data = cache.get(image.id, variant)
+            data = cache.get(image.id, variant.token)
             if data is None:
-                data = _convert(
-                    image, target_format, effective_quality, variant, storage, settings, cache
-                )
-    return Response(data, media_type=FORMATS[target_format].mime_type, headers=headers)
+                if gate is not None:
+                    gate.charge()
+                data = _render(image, variant, storage, settings, cache)
+    return Response(data, media_type=FORMATS[variant.spec.format].mime_type, headers=headers)
 
 
-def _convert(
-    image: Image,
-    target_format: str,
-    quality: int | None,
-    variant: str,
-    storage: Storage,
-    settings: Settings,
-    cache: VariantCache,
+def _render(
+    image: Image, variant: Variant, storage: Storage, settings: Settings, cache: VariantCache
 ) -> bytes:
     loaded = load_image(storage.read(image.storage_key), settings.max_image_pixels)
-    data = apply_transformations(
-        loaded,
-        TransformationSpec(format=target_format, quality=quality),
-        settings.max_dimension,
-    ).data
-    cache.set(image.id, variant, data)
+    data = apply_transformations(loaded, variant.spec, settings.max_dimension).data
+    cache.set(image.id, variant.token, data)
     return data
 
 

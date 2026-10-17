@@ -26,6 +26,9 @@ os.environ["TRANSFORM_RATE_LIMIT_PER_HOUR"] = "500"
 os.environ["SHARE_MAX_TTL_SECONDS"] = str(30 * 24 * 60 * 60)
 os.environ["SHARE_MAX_CONCURRENT_CONVERSIONS"] = "2"
 os.environ["STORAGE_QUOTA_BYTES"] = str(1024**3)
+os.environ["SIGNED_URL_MAX_CONCURRENT_RENDERS"] = "2"
+os.environ["SIGNED_URL_RENDER_MEGAPIXELS_PER_MINUTE"] = "300"
+os.environ["SIGNED_URL_RENDER_MEGAPIXELS_PER_HOUR"] = "5000"
 # Webhook payloads then link to the same URLs as the API's responses to the test client.
 os.environ["PUBLIC_BASE_URL"] = "http://testserver"
 os.environ["WEBHOOK_SENDERS"] = "4"
@@ -44,7 +47,7 @@ from app.cache import get_variant_cache  # noqa: E402
 from app.config import Settings, get_settings  # noqa: E402
 from app.db import Base, get_engine, get_sessionmaker  # noqa: E402
 from app.main import app  # noqa: E402
-from app.ratelimit import get_transform_rate_limiter  # noqa: E402
+from app.ratelimit import get_render_rate_limiter, get_transform_rate_limiter  # noqa: E402
 from app.redis_client import create_redis_client  # noqa: E402
 from app.storage import LocalStorage, get_storage  # noqa: E402
 from app.storage_s3 import S3Storage, create_s3_client  # noqa: E402
@@ -120,10 +123,17 @@ def rate_limiter() -> FakeRateLimiter:
 
 
 @pytest.fixture
-def client(clean_db, storage, variant_cache, rate_limiter):
+def render_rate_limiter() -> FakeRateLimiter:
+    """Stands in for the signed URLs' render limiter."""
+    return FakeRateLimiter()
+
+
+@pytest.fixture
+def client(clean_db, storage, variant_cache, rate_limiter, render_rate_limiter):
     app.dependency_overrides[get_storage] = lambda: storage
     app.dependency_overrides[get_variant_cache] = lambda: variant_cache
     app.dependency_overrides[get_transform_rate_limiter] = lambda: rate_limiter
+    app.dependency_overrides[get_render_rate_limiter] = lambda: render_rate_limiter
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

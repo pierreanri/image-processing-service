@@ -7,10 +7,10 @@ from app.cache import VariantCache, get_variant_cache
 from app.config import Settings, get_settings
 from app.db import get_db
 from app.models import User
-from app.ratelimit import RateLimiter, get_transform_rate_limiter
+from app.ratelimit import RateLimiter, get_render_rate_limiter, get_transform_rate_limiter
 from app.security import get_current_user
 from app.sharing import ConversionSlots, ShareSigner, get_share_conversion_slots, get_share_signer
-from app.signed_urls import UrlSigner, get_url_signer
+from app.signed_urls import UrlSigner, get_signed_render_slots, get_url_signer
 from app.storage import Storage, get_storage
 from app.webhooks import WebhookSecrets, get_webhook_secrets
 
@@ -24,3 +24,5 @@ ShareSignerDep = Annotated[ShareSigner, Depends(get_share_signer)]
 ShareConversionSlotsDep = Annotated[ConversionSlots, Depends(get_share_conversion_slots)]
 WebhookSecretsDep = Annotated[WebhookSecrets, Depends(get_webhook_secrets)]
 UrlSignerDep = Annotated[UrlSigner, Depends(get_url_signer)]
+SignedRenderSlotsDep = Annotated[ConversionSlots, Depends(get_signed_render_slots)]
+RenderRateLimiterDep = Annotated[RateLimiter, Depends(get_render_rate_limiter)]
