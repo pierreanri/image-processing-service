@@ -224,3 +224,17 @@ class WebhookDelivery(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # When the event was delivered, given up on, or canceled.
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UrlSigningKey(Base):
+    """An account's URL signing key (see app/signed_urls.py): only its public id is stored, the
+    key is derived from it."""
+
+    __tablename__ = "url_signing_keys"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    # Unique: the key depends on its id alone, so two accounts must never share one.
+    key_id: Mapped[str] = mapped_column(String(16), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

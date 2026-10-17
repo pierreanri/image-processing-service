@@ -10,6 +10,7 @@ from app.models import User
 from app.ratelimit import RateLimiter, get_transform_rate_limiter
 from app.security import get_current_user
 from app.sharing import ConversionSlots, ShareSigner, get_share_conversion_slots, get_share_signer
+from app.signed_urls import UrlSigner, get_url_signer
 from app.storage import Storage, get_storage
 from app.webhooks import WebhookSecrets, get_webhook_secrets
 
@@ -22,3 +23,4 @@ TransformRateLimiterDep = Annotated[RateLimiter, Depends(get_transform_rate_limi
 ShareSignerDep = Annotated[ShareSigner, Depends(get_share_signer)]
 ShareConversionSlotsDep = Annotated[ConversionSlots, Depends(get_share_conversion_slots)]
 WebhookSecretsDep = Annotated[WebhookSecrets, Depends(get_webhook_secrets)]
+UrlSignerDep = Annotated[UrlSigner, Depends(get_url_signer)]

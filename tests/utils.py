@@ -297,3 +297,13 @@ class RecordingStop:
     def wait(self, timeout: float) -> bool:
         self.waits.append(timeout)
         return self.is_set()
+
+
+# --- Signed URLs ----------------------------------------------------------------------------------
+
+
+def create_url_signing_key(client: TestClient, headers: dict) -> dict:
+    """POST /me/url-signing-key, expecting a new key; returns the body (with the key)."""
+    response = client.post("/me/url-signing-key", headers=headers)
+    assert response.status_code == 201, response.text
+    return response.json()

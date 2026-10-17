@@ -345,3 +345,22 @@ class WebhookEvent(BaseModel):
     type: WebhookEventType
     timestamp: datetime = Field(description="When the job finished.")
     data: JobData = Field(description="The job, as GET /jobs/{id} describes it when sent.")
+
+
+# --- Signed URLs ----------------------------------------------------------------------------------
+
+
+class UrlSigningKeyOut(BaseModel):
+    key_id: str = Field(description="Names the key in every URL it signs; not secret.")
+    url_prefix: str = Field(
+        description="Signed URLs start with this. Your CDN's address may replace the API's: it "
+        "isn't signed."
+    )
+    created_at: datetime
+
+
+class UrlSigningKeySecretOut(UrlSigningKeyOut):
+    key: str = Field(
+        description="The key (`urlsec_` and 43 characters), shown only now: sign URLs with this "
+        "string as is (see the README), on your server only."
+    )

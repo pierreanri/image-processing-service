@@ -9,7 +9,7 @@ from app.cache import get_variant_cache
 from app.config import get_settings
 from app.imaging import ImageProcessingError
 from app.ratelimit import get_transform_rate_limiter
-from app.routers import auth, images, jobs, shared, webhooks
+from app.routers import auth, images, jobs, shared, url_signing_key, webhooks
 from app.sharing import (
     ACCESS_LOG_FILTER,
     ConversionsBusyError,
@@ -17,6 +17,7 @@ from app.sharing import (
     get_share_signer,
     redact_share_tokens,
 )
+from app.signed_urls import get_url_signer
 from app.storage import StorageUnavailableError, get_storage
 from app.webhooks import get_webhook_secrets
 
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     get_transform_rate_limiter()
     get_share_signer()
     get_share_conversion_slots()
+    get_url_signer()
     get_webhook_secrets()
     if not settings.public_base_url:
         logger.warning("Webhooks are off: PUBLIC_BASE_URL is not set")
@@ -54,6 +56,7 @@ def create_app() -> FastAPI:
     app.include_router(images.router)
     app.include_router(jobs.router)
     app.include_router(shared.router)
+    app.include_router(url_signing_key.router)
     app.include_router(webhooks.router)
     app.webhooks.include_router(webhooks.events)
 
