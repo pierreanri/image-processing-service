@@ -1129,8 +1129,9 @@ any number of variants. Renders are therefore limited in three ways.
    - Over the limit, renders get `429` with `Retry-After`. There are no `RateLimit` fields:
      viewers aren't the account.
 3. **Per render.** Renders have the limits of `POST /transform` (`MAX_DIMENSION`,
-   `MAX_IMAGE_PIXELS`). A crop outside the image, or a result that would be too large, is refused
-   from the image's stored size, before the image is read.
+   `MAX_IMAGE_PIXELS`). A crop outside the image, a result that would be too large, or an image
+   over `MAX_IMAGE_PIXELS` (lowered since it was stored) is refused from the image's stored size,
+   before the image is read or the account charged.
 
 **Memory.** A render's memory peaks at a few copies of the larger of its source and its result.
 At the defaults (50-megapixel sources, 10000 × 10000 results, 4 bytes a pixel), budget about 2 GB
@@ -1203,9 +1204,12 @@ your application's images at scale.
   later renders through signed URLs a charge. Lossless formats ignore `quality`, so they get one entry and one ETag. The cache is only read
   after the ownership (share-link, signed-URL) check, the `304` check and the original-file check, so it can
   never serve one user's image to another. Deleting an image drops its hash; if that fails (Redis down), the
-  leftover can't be served and expires with the TTL. Bump `v1` when encoder output changes.
-- **Cache memory**: the TTL is refreshed whenever a conversion is added, entries over
-  `CACHE_MAX_ITEM_BYTES` are skipped, and the total is bounded by Redis itself. Run Redis with
+  leftover can't be served and expires with the TTL. Bump the version in `KEY_PREFIX` (now `v2`)
+  when encoder output changes.
+- **Cache memory**: the TTL is refreshed whenever a conversion is added (or the marker of one too
+  large to keep, rewritten at each of its renders: a much-requested large variant keeps its
+  image's hash alive), the bytes of entries over `CACHE_MAX_ITEM_BYTES` are skipped, and the
+  total is bounded by Redis itself. Run Redis with
   `maxmemory` and `allkeys-lru` (or `volatile-lru` on a shared instance, since every key has a
   TTL). With `noeviction`, new conversions stop being cached once it is full.
 - **Cache failures fail open**, and a conversion is always served:
@@ -1228,9 +1232,11 @@ your application's images at scale.
   for the cache). Losing counters (a restart without persistence, eviction, a failover) only resets
   windows early. Keep `allkeys-lru` (or `volatile-lru`); never `volatile-ttl`, which would evict the
   counters before cached conversions. A Redis ACL user needs `+get +incr +incrby +expire +pttl
-  +evalsha +script|load` on `~imgsvc:*` for the limiters (plus the hash commands for the cache).
-  `+incrby` is new with signed URLs' render limits: without it, transformations are still counted
-  (with `INCR`) but signed URL renders aren't limited (one warning per outage).
+  +evalsha +script|load` on `~imgsvc:*` for the limiters, and `+hget +hset +hexists +expire
+  +unlink +multi +exec` (or `+@hash +expire +unlink +multi +exec`) for the cache. `+incrby` and
+  `+hexists` are new with signed URLs. Without `+incrby`, transformations are still counted (with
+  `INCR`) but signed URL renders aren't limited (one warning per outage); without `+hexists`, each
+  signed URL render turns the cache off for 5 seconds.
 - **Redis timeouts**: `REDIS_TIMEOUT_SECONDS` bounds each connection attempt, read and write, for
   both the cache and the limiter. While Redis stops answering, requests already in flight each wait
   up to that long before it is skipped. A hostname with several addresses is tried one address at a
@@ -1340,12 +1346,13 @@ your application's images at scale.
   3. The request waits for one of the signed render slots. These are separate from share links'
      and are counted per account as well as in all.
   4. With a slot, it looks in the cache again (a request it waited for may have rendered the same
-     variant), reads the source, and only then counts the megapixels and renders. PNGs are
-     compressed at zlib level 3 instead of being optimized: a 12-megapixel photo takes about a
-     second instead of half a minute, for a file typically 10–30% larger. That's also why the cache key's
-     version went from `v1` to `v2`.
+     variant, or found it too large to cache and been charged for it), reads the source, and only
+     then counts the megapixels and renders. PNGs are compressed at zlib level 3 instead of being
+     optimized: a 12-megapixel photo takes about a second instead of half a minute, for a file
+     typically 10–30% larger. That's also why the cache key's version went from `v1` to `v2`.
 
-  The budget uses the transform limiter's Lua script with a cost (`INCRBY`), under
+  The budget uses the transform limiter's Lua script, weighted (counting costs with `INCRBY`
+  where the transform limiter counts requests with `INCR`), under
   `imgsvc:ratelimit:v1:render:{user id}:minute|hour`, and fails open like it. Transformations are
   cached as `{format}-t{hash}`, the hash being the first 32 hex digits of the SHA-256 of the
   canonical options without `exp_`. Conversion-only URLs use the conversions' tokens.

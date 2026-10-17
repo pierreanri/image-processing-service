@@ -17,6 +17,7 @@ from app.main import app
 from app.ratelimit import (
     KEY_PREFIX,
     RENDER_KEY_PREFIX,
+    UNCHECKED,
     Limit,
     RateLimitDecision,
     RateLimiter,
@@ -189,7 +190,7 @@ def render_keys_of(user_id: uuid.UUID) -> tuple[str, str]:
 
 def test_costs_count_until_the_next_one_would_not_fit(redis_client, new_user_id):
     user_id = new_user_id()
-    limiter = RateLimiter(redis_client, (Limit("minute", 10, 60),))
+    limiter = RateLimiter(redis_client, (Limit("minute", 10, 60),), weighted=True)
 
     assert checked(limiter.hit(user_id, cost=4)).allowed
     assert checked(limiter.hit(user_id, cost=4)).allowed
@@ -205,7 +206,7 @@ def test_costs_count_until_the_next_one_would_not_fit(redis_client, new_user_id)
 
 def test_checks_count_nothing(redis_client, new_user_id):
     user_id = new_user_id()
-    limiter = RateLimiter(redis_client, (Limit("minute", 10, 60),))
+    limiter = RateLimiter(redis_client, (Limit("minute", 10, 60),), weighted=True)
 
     assert checked(limiter.check(user_id, cost=10)).allowed
     assert redis_client.exists(keys_of(user_id)[0]) == 0
@@ -214,9 +215,10 @@ def test_checks_count_nothing(redis_client, new_user_id):
     assert redis_client.get(keys_of(user_id)[0]) == b"9"
 
 
-def test_single_requests_are_counted_without_incrby(redis_client, new_user_id):
-    """Through a Redis user with only the commands the previous README listed for the limiter
-    (before costs, which need +incrby)."""
+def test_without_incrby_only_transformations_are_counted(redis_client, new_user_id, caplog):
+    """Through a Redis user with only the commands the previous README listed for the limiter:
+    render limits (weighted, with INCRBY) then fail every time, with one warning, rather than
+    working for some renders only."""
     user_id = new_user_id()
     name, password = f"imgsvc-test-{uuid.uuid4().hex}", uuid.uuid4().hex
     commands = ["+get", "+incr", "+expire", "+pttl", "+evalsha", "+script|load", "+select"]
@@ -232,9 +234,16 @@ def test_single_requests_are_counted_without_incrby(redis_client, new_user_id):
     )
     try:
         limiter = RateLimiter(restricted, (Limit("minute", 3, 60),))
+        renders = RateLimiter(
+            restricted, (Limit("minute", 3, 60),), weighted=True, cooldown_seconds=0
+        )
 
         assert checked(limiter.hit(user_id)).allowed
         assert redis_client.get(keys_of(user_id)[0]) == b"1"
+        assert [renders.hit(user_id, cost=cost) for cost in (1, 2, 1)] == [UNCHECKED] * 3
+        warnings = [r for r in caplog.get_records("call") if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1 and "can't run this command" in warnings[0].getMessage()
+        caplog.clear()  # expected, unlike the failures limiter_must_reach_redis looks for
     finally:
         restricted.close()
         redis_client.acl_deluser(name)
@@ -245,6 +254,7 @@ def test_render_limits_count_apart_from_transform_limits(redis_client, new_user_
     renders = RateLimiter(
         redis_client,
         (Limit("minute", 300, 60), Limit("hour", 5000, 3600)),
+        weighted=True,
         key_prefix=RENDER_KEY_PREFIX,
     )
     try:

@@ -31,11 +31,14 @@ RENDER_KEY_PREFIX = "imgsvc:ratelimit:v1:render"
 
 # KEYS[i] counts one user's requests in the current window of limit i, which allows ARGV[2i-1]
 # per ARGV[2i] seconds. The request costs ARGV[2n+1], and is counted unless ARGV[2n+2] is "0"
-# (a check). Returns {allowed (1 or 0), count_1, pttl_ms_1, count_2, ...}.
+# (a check): with INCRBY if ARGV[2n+3] is "1" (a weighted limiter), else with INCR (so the Redis
+# user of a limiter that only counts requests needs no +incrby). Returns {allowed (1 or 0),
+# count_1, pttl_ms_1, count_2, ...}.
 _SCRIPT = """
 local n = #KEYS
 local cost = tonumber(ARGV[2 * n + 1])
 local count = ARGV[2 * n + 2] ~= '0'
+local weighted = ARGV[2 * n + 3] == '1'
 local counts, allowed = {}, 1
 for i, key in ipairs(KEYS) do
     counts[i] = tonumber(redis.call('GET', key) or '0')
@@ -45,11 +48,10 @@ for i, key in ipairs(KEYS) do
 end
 local reply = {allowed}
 for i, key in ipairs(KEYS) do
-    if allowed == 1 and count and cost == 1 then
-        -- INCR, so a Redis ACL from before costs (without +incrby) still counts transformations.
-        counts[i] = redis.call('INCR', key)
-    elseif allowed == 1 and count then
+    if allowed == 1 and count and weighted then
         counts[i] = redis.call('INCRBY', key, cost)
+    elseif allowed == 1 and count then
+        counts[i] = redis.call('INCR', key)
     end
     local ttl = redis.call('PTTL', key)
     if ttl == -1 then
@@ -121,14 +123,16 @@ UNCHECKED = RateLimitDecision(allowed=True)
 
 
 class RateLimiter:
-    """Counts each user's requests against every limit at once. Without a client or limits it
-    allows everything without calling Redis."""
+    """Counts each user's requests against every limit at once: each request counts 1, or, if
+    `weighted`, its cost. Without a client or limits it allows everything without calling
+    Redis."""
 
     def __init__(
         self,
         client: redis.Redis | None,
         limits: Sequence[Limit],
         *,
+        weighted: bool = False,
         key_prefix: str = KEY_PREFIX,
         feature: str = "Transform rate limiter",
         consequence: str = "transformations are not rate limited",
@@ -136,6 +140,7 @@ class RateLimiter:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._limits = tuple(limits)
+        self._weighted = weighted
         self._key_prefix = key_prefix
         # Only hashes the script locally; redis-py loads it into Redis on first use.
         self._script = (
@@ -158,13 +163,16 @@ class RateLimiter:
         return self._run(user_id, cost, count=False)
 
     def _run(self, user_id: uuid.UUID, cost: int, *, count: bool) -> RateLimitDecision:
+        if cost != 1 and not self._weighted:
+            raise ValueError("This limiter counts requests: every request costs 1")
         if self._script is None or not self._outage.usable():
             return UNCHECKED
         cost = min(max(cost, 1), self._max_cost)
         keys = [f"{self._key_prefix}:{user_id.hex}:{limit.name}" for limit in self._limits]
         started = self._outage.now()
         try:
-            reply = self._script(keys=keys, args=[*self._args, cost, int(count)])
+            args = [*self._args, cost, int(count), int(self._weighted)]
+            reply = self._script(keys=keys, args=args)
         except redis.RedisError as exc:
             self._outage.failed(exc)
             return UNCHECKED
@@ -232,6 +240,7 @@ def build_render_rate_limiter(settings: Settings, client: redis.Redis | None) ->
     return RateLimiter(
         client,
         limits,
+        weighted=True,
         key_prefix=RENDER_KEY_PREFIX,
         feature="Signed URL render limiter",
         consequence="signed URL renders are not rate limited",

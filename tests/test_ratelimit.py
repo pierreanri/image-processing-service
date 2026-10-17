@@ -57,7 +57,7 @@ def test_hit_runs_one_script_over_every_limit(redis_mock, script):
     hit_with(redis_mock, script, FRESH_REPLY)
 
     redis_mock.register_script.assert_called_once_with(_SCRIPT)
-    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 1, 1])
+    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 1, 1, 0])
 
 
 def test_allowed_hit_reports_every_limit(redis_mock, script):
@@ -126,7 +126,7 @@ def test_inconsistent_replies_raise(redis_mock, script, reply):
 def test_only_enabled_limits_are_sent(redis_mock, script):
     decision = hit_with(redis_mock, script, [1, 1, 3_600_000], limits=(HOUR,))
 
-    script.assert_called_once_with(keys=[HOUR_KEY], args=[500, 3600, 1, 1])
+    script.assert_called_once_with(keys=[HOUR_KEY], args=[500, 3600, 1, 1, 0])
     assert decision.headers() == {
         "RateLimit-Policy": '"hour";q=500;w=3600',
         "RateLimit": '"hour";r=499;t=3600',
@@ -227,7 +227,7 @@ def test_a_successful_check_does_not_end_an_outage(redis_mock, script, clock, ca
     """A check runs only GET and PTTL, which a read-only or full Redis still answers: only a
     counted request proves that Redis takes writes again."""
     caplog.set_level(logging.DEBUG, logger="app.ratelimit")
-    limiter = RateLimiter(redis_mock, (MINUTE, HOUR), clock=clock)
+    limiter = RateLimiter(redis_mock, (MINUTE, HOUR), weighted=True, clock=clock)
 
     script.side_effect = redis.exceptions.ReadOnlyError("read only")
     assert limiter.hit(USER) is UNCHECKED
@@ -239,6 +239,15 @@ def test_a_successful_check_does_not_end_an_outage(redis_mock, script, clock, ca
     assert limiter.hit(USER, cost=3) is UNCHECKED
 
     assert limiter_log_levels(caplog) == ["WARNING", "DEBUG"]
+
+
+def test_a_limiter_that_counts_requests_takes_no_costs(redis_mock, script):
+    limiter = RateLimiter(redis_mock, (MINUTE, HOUR))
+
+    for call in (limiter.hit, limiter.check):
+        with pytest.raises(ValueError):
+            call(USER, cost=2)
+    script.assert_not_called()
 
 
 def test_non_redis_errors_propagate(redis_mock, script):
@@ -307,9 +316,9 @@ def test_disabled_limits_without_redis_are_not_warned_about(caplog):
 def test_a_request_can_cost_more_than_one(redis_mock, script):
     script.return_value = [1, 12, 33_400, 40, 1_799_001]
 
-    decision = RateLimiter(redis_mock, (MINUTE, HOUR)).hit(USER, cost=7)
+    decision = RateLimiter(redis_mock, (MINUTE, HOUR), weighted=True).hit(USER, cost=7)
 
-    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 7, 1])
+    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 7, 1, 1])
     assert decision.allowed and decision.cost == 7
 
 
@@ -317,7 +326,7 @@ def test_a_rejected_costly_request_names_the_limits_it_would_exceed(redis_mock, 
     """5 left of 30 is not enough for 7: the minute limit is exceeded though not used up."""
     script.return_value = [0, 25, 13_001, 40, 1_799_001]
 
-    decision = RateLimiter(redis_mock, (MINUTE, HOUR)).hit(USER, cost=7)
+    decision = RateLimiter(redis_mock, (MINUTE, HOUR), weighted=True).hit(USER, cost=7)
 
     assert not decision.allowed
     assert decision.exceeded == (decision.states[0],)
@@ -328,17 +337,17 @@ def test_a_cost_is_capped_at_the_smallest_limit(redis_mock, script):
     """Otherwise a request costing more than a whole window could never succeed."""
     script.return_value = FRESH_REPLY
 
-    RateLimiter(redis_mock, (MINUTE, HOUR)).hit(USER, cost=10_000)
+    RateLimiter(redis_mock, (MINUTE, HOUR), weighted=True).hit(USER, cost=10_000)
 
-    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 30, 1])
+    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 30, 1, 1])
 
 
 def test_a_check_counts_nothing(redis_mock, script):
     script.return_value = FRESH_REPLY
 
-    RateLimiter(redis_mock, (MINUTE, HOUR)).check(USER, cost=3)
+    RateLimiter(redis_mock, (MINUTE, HOUR), weighted=True).check(USER, cost=3)
 
-    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 3, 0])
+    script.assert_called_once_with(keys=[MINUTE_KEY, HOUR_KEY], args=[30, 60, 500, 3600, 3, 0, 1])
 
 
 def test_render_limiters_count_megapixels_under_keys_of_their_own(redis_mock, script):
@@ -348,7 +357,7 @@ def test_render_limiters_count_megapixels_under_keys_of_their_own(redis_mock, sc
 
     prefix = f"{RENDER_KEY_PREFIX}:{USER.hex}"
     script.assert_called_once_with(
-        keys=[f"{prefix}:minute", f"{prefix}:hour"], args=[300, 60, 5000, 3600, 4, 1]
+        keys=[f"{prefix}:minute", f"{prefix}:hour"], args=[300, 60, 5000, 3600, 4, 1, 1]
     )
 
 

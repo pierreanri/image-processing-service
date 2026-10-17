@@ -693,10 +693,13 @@ def test_what_cannot_be_rendered_is_refused_before_reading_the_image(
 
 
 def test_images_too_large_to_render_are_refused_and_briefly_cached(
-    client, auth_headers, signer, key, settings
+    client, auth_headers, signer, key, settings, storage, render_rate_limiter
 ):
     image = upload(client, auth_headers)
     settings.max_image_pixels = 1000  # lowered since the upload
+    read = storage.read
+    storage.read = lambda key: pytest.fail("the image must not be read")
+    app.dependency_overrides[get_signed_render_slots] = lambda: NoSlots(1)
 
     response = client.get(signed_url(key, image["id"], "webp", "w_32"))
 
@@ -704,7 +707,10 @@ def test_images_too_large_to_render_are_refused_and_briefly_cached(
     assert response.json() == {"detail": "Image is too large (64x48 pixels)"}
     assert response.headers["cache-control"] == "public, max-age=300"
     assert response.headers["access-control-allow-origin"] == "*"
+    # Refused from its stored size: nothing to pay for.
+    assert render_rate_limiter.checks == [] and render_rate_limiter.costs == []
     # The stored file needs no rendering.
+    storage.read = read
     assert client.get(signed_url(key, image["id"], "png")).status_code == 200
 
 
@@ -846,6 +852,36 @@ def test_a_variant_too_large_to_cache_is_rendered_each_time_but_charged_once(
     assert uuid.UUID(image["id"]) not in variant_cache.entries
 
 
+def test_a_render_that_waited_for_a_variant_too_large_to_cache_is_not_charged(
+    client, auth_headers, signer, key, storage, variant_cache, render_rate_limiter
+):
+    """A crowd on a new variant that turns out too large to cache: those that waited for the
+    first render still render it (it isn't cached), but only the first is charged."""
+    variant_cache.max_item_bytes = 100
+    image = upload(client, auth_headers)
+    image_id = uuid.UUID(image["id"])
+    parsed = parse_options("w_32", "png")
+    token = transformation_variant("png", parsed.spec, parsed.transformations).token
+
+    class FinishesAnotherRenderFirst(ConversionSlots):
+        def hold(self, *args):
+            # The render this request waited for found the variant too large to cache.
+            variant_cache.set(image_id, token, b"x" * 101)
+            return super().hold(*args)
+
+    app.dependency_overrides[get_signed_render_slots] = lambda: FinishesAnotherRenderFirst(1)
+    reads = []
+    read = storage.read
+    storage.read = lambda key: reads.append(key) or read(key)
+
+    response = client.get(signed_url(key, image["id"], "png", "w_32"))
+
+    assert response.status_code == 200
+    assert len(reads) == 1  # rendered...
+    assert render_rate_limiter.hits == []  # ...but not charged again
+    assert len(render_rate_limiter.checks) == 1  # it was admitted before it waited
+
+
 def test_a_storage_outage_costs_the_account_nothing(
     client, auth_headers, signer, key, storage, render_rate_limiter
 ):
@@ -920,7 +956,9 @@ def test_a_render_refused_when_charged_frees_its_slot(
 def test_the_render_budget_is_counted_in_redis(client, auth_headers, signer, key, redis_client):
     owner = user_id_of(auth_headers)
     counter = f"{RENDER_KEY_PREFIX}:{owner.hex}:minute"
-    limiter = RateLimiter(redis_client, (Limit("minute", 3, 60),), key_prefix=RENDER_KEY_PREFIX)
+    limiter = RateLimiter(
+        redis_client, (Limit("minute", 3, 60),), weighted=True, key_prefix=RENDER_KEY_PREFIX
+    )
     app.dependency_overrides[get_render_rate_limiter] = lambda: limiter
     image = upload(client, auth_headers, make_image_bytes(size=(2000, 1000)))
     try:

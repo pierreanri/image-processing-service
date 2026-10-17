@@ -15,7 +15,13 @@ from starlette.types import Receive, Scope, Send
 
 from app.cache import VariantCache
 from app.config import Settings
-from app.imaging import DEFAULT_QUALITY, FORMATS, apply_transformations, load_image
+from app.imaging import (
+    DEFAULT_QUALITY,
+    FORMATS,
+    InvalidImageError,
+    apply_transformations,
+    load_image,
+)
 from app.models import Image
 from app.schemas import TransformationSpec
 from app.sharing import ConversionSlots
@@ -124,6 +130,10 @@ def send_variant(
 
     data = cache.get(image.id, variant.token)
     if data is None:
+        if image.width * image.height > settings.max_image_pixels:
+            # As load_image would refuse it (MAX_IMAGE_PIXELS lowered since the image was
+            # stored), but before reading it, taking a slot or charging for it.
+            raise InvalidImageError(f"Image is too large ({image.width}x{image.height} pixels)")
         # A variant too large to cache is rendered for every request, but charged only once.
         charge = None
         if gate is not None and not cache.too_large(image.id, variant.token):
@@ -134,9 +144,12 @@ def send_variant(
             if charge is not None:
                 gate.admit()
             with conversion_slots.hold(None if gate is None else gate.owner):
-                # A request this one waited for may have just cached the same variant.
+                # A request this one waited for may have just cached the same variant, or
+                # found it too large to cache (and been charged for it).
                 data = cache.get(image.id, variant.token)
                 if data is None:
+                    if charge is not None and cache.too_large(image.id, variant.token):
+                        charge = None
                     data = _render(image, variant, storage, settings, cache, charge)
     return Response(data, media_type=FORMATS[variant.spec.format].mime_type, headers=headers)
 
