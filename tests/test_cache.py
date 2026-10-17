@@ -57,14 +57,34 @@ def test_get_reads_variant_from_image_hash(client):
     client.hget.assert_called_once_with(KEY, "webp-q80")
 
 
-def test_set_skips_variants_over_size_cap(client):
+def test_variants_over_the_size_cap_are_only_remembered(client):
     cache = make_cache(client, max_item_bytes=10)
 
     cache.set(IMAGE_ID, "png-qdefault", b"x" * 11)
-    client.pipeline.assert_not_called()
+    cache.set(IMAGE_ID, "png-q50", b"x" * 10)
 
-    cache.set(IMAGE_ID, "png-qdefault", b"x" * 10)
-    client.pipeline.assert_called_once()
+    pipe = pipeline_of(client)
+    assert pipe.hset.call_args_list == [
+        ((KEY, "png-qdefault:too-large", b""),),
+        ((KEY, "png-q50", b"x" * 10),),
+    ]
+    assert pipe.expire.call_count == 2
+
+
+def test_too_large_asks_for_the_marker(client):
+    client.hexists.return_value = True
+
+    assert make_cache(client).too_large(IMAGE_ID, "png-t1234") is True
+    client.hexists.assert_called_once_with(KEY, "png-t1234:too-large")
+    client.hexists.return_value = False
+    assert make_cache(client).too_large(IMAGE_ID, "png-t1234") is False
+
+
+def test_too_large_is_false_while_redis_fails(client):
+    client.hexists.side_effect = redis.ConnectionError("down")
+
+    assert make_cache(client).too_large(IMAGE_ID, "png-t1234") is False
+    assert make_cache(None).too_large(IMAGE_ID, "png-t1234") is False
 
 
 def test_invalidate_unlinks_image_hash(client):

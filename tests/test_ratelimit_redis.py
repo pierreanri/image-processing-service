@@ -11,6 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import redis
 
 from app.main import app
 from app.ratelimit import (
@@ -211,6 +212,32 @@ def test_checks_count_nothing(redis_client, new_user_id):
     limiter.hit(user_id, cost=9)
     assert not checked(limiter.check(user_id, cost=2)).allowed
     assert redis_client.get(keys_of(user_id)[0]) == b"9"
+
+
+def test_single_requests_are_counted_without_incrby(redis_client, new_user_id):
+    """Through a Redis user with only the commands the previous README listed for the limiter
+    (before costs, which need +incrby)."""
+    user_id = new_user_id()
+    name, password = f"imgsvc-test-{uuid.uuid4().hex}", uuid.uuid4().hex
+    commands = ["+get", "+incr", "+expire", "+pttl", "+evalsha", "+script|load", "+select"]
+    try:
+        redis_client.acl_setuser(
+            name, enabled=True, passwords=[f"+{password}"], keys=["imgsvc:*"], commands=commands
+        )
+    except redis.ResponseError as exc:
+        pytest.skip(f"Redis ACLs unavailable: {exc}")
+    kwargs = redis_client.connection_pool.connection_kwargs
+    restricted = redis.Redis(
+        host=kwargs["host"], port=kwargs["port"], db=kwargs["db"], username=name, password=password
+    )
+    try:
+        limiter = RateLimiter(restricted, (Limit("minute", 3, 60),))
+
+        assert checked(limiter.hit(user_id)).allowed
+        assert redis_client.get(keys_of(user_id)[0]) == b"1"
+    finally:
+        restricted.close()
+        redis_client.acl_deluser(name)
 
 
 def test_render_limits_count_apart_from_transform_limits(redis_client, new_user_id):

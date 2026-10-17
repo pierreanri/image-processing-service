@@ -45,7 +45,10 @@ for i, key in ipairs(KEYS) do
 end
 local reply = {allowed}
 for i, key in ipairs(KEYS) do
-    if allowed == 1 and count then
+    if allowed == 1 and count and cost == 1 then
+        -- INCR, so a Redis ACL from before costs (without +incrby) still counts transformations.
+        counts[i] = redis.call('INCR', key)
+    elseif allowed == 1 and count then
         counts[i] = redis.call('INCRBY', key, cost)
     end
     local ttl = redis.call('PTTL', key)

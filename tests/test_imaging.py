@@ -9,6 +9,7 @@ from app.imaging import (
     TransformationError,
     UnsupportedFormatError,
     apply_transformations,
+    encode_image,
     load_image,
 )
 from app.schemas import TransformationSpec
@@ -309,3 +310,22 @@ def test_empty_spec_is_rejected():
 def test_unknown_keys_are_rejected():
     with pytest.raises(ValueError):
         TransformationSpec(filters={"grayscal": True})
+
+
+def test_fast_png_encoding_keeps_the_pixels():
+    """Variants rendered on every request trade a little size for speed: losslessly."""
+    image = Image.merge(
+        "RGB",
+        [
+            Image.linear_gradient("L"),
+            Image.radial_gradient("L"),
+            Image.effect_noise((256, 256), 40),
+        ],
+    )
+
+    optimized = encode_image(image, "png")
+    fast = encode_image(image, "png", fast=True)
+
+    assert fast.data != optimized.data
+    for encoded in (optimized, fast):
+        assert Image.open(io.BytesIO(encoded.data)).tobytes() == image.tobytes()

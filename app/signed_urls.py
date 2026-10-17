@@ -117,13 +117,17 @@ def get_url_signer() -> UrlSigner:
 @lru_cache
 def get_signed_render_slots() -> ConversionSlots:
     """The renders signed URLs may run at once in this process: apart from share links'
-    conversions, and at most half of them (one, at least) for any one account."""
+    conversions, and at most half of them (one, at least) for any one account. One account may
+    also fill the waiting room but for a place per slot it can't hold (one, at least), so a page
+    of new URLs waits its turn while other accounts can still queue."""
     slots = get_settings().signed_url_max_concurrent_renders
+    max_waiting = min(WAITERS_PER_SLOT * slots, MAX_WAITERS)
+    owner_slots = max(1, slots // 2)
     return ConversionSlots(
         slots,
-        max_waiting=min(WAITERS_PER_SLOT * slots, MAX_WAITERS),
-        owner_slots=max(1, slots // 2),
-        owner_waiting=slots,
+        max_waiting=max_waiting,
+        owner_slots=owner_slots,
+        owner_waiting=max(1, max_waiting - max(1, slots - owner_slots)),
     )
 
 

@@ -125,9 +125,7 @@ def get_signed_image(
         width, height = predict_output_size(
             image.width, image.height, variant.spec, variant.spec.format, settings.max_dimension
         )
-        gate = _RenderBudget(
-            render_limiter, image.owner_id, max(1, math.ceil(width * height / 1_000_000))
-        )
+        gate = _RenderBudget(render_limiter, image.owner_id, _render_cost(image, width, height))
 
     if options.expires is None:
         max_age, shared_max_age = MAX_AGE_SECONDS, SHARED_MAX_AGE_SECONDS
@@ -164,6 +162,13 @@ def unknown_signed_path(rest: str) -> None:
     """Any other path under /signed, such as one with too few segments: answered like a URL this
     service didn't sign."""
     raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND, headers=_NO_STORE)
+
+
+def _render_cost(image: Image, width: int, height: int) -> int:
+    """The megapixels a render of `image` as `width`x`height` costs: the output's, or a quarter
+    of the source's if that is more (decoding a large image isn't free either)."""
+    pixels = max(width * height, image.width * image.height / 4)
+    return max(1, math.ceil(pixels / 1_000_000))
 
 
 @dataclass(frozen=True)

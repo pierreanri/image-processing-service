@@ -34,9 +34,9 @@ transformed images straight to browsers and CDNs.
   image's links ends all of them at once
 - Signed URLs, in the spirit of Cloudinary's delivery URLs: your backend signs URLs that carry
   any transformation (`…/w_800,h_600,c_cover,q_80/{image id}.webp`) with its account's key,
-  without calling the API. Variants are rendered on their first request and cached in Redis,
-  CDNs and browsers. Renders are limited per process and per account, and rotating the key ends
-  every URL
+  without calling the API. Variants are rendered on their first request and cached by CDNs,
+  browsers and (up to `CACHE_MAX_ITEM_BYTES`) Redis. Renders are limited per process and per
+  account, and rotating the key ends every URL
 - Conversions are cached in Redis when `REDIS_URL` is set; Redis is optional and the service keeps
   working, uncached, without it or while it is down
 - Per-user rate limits on transformations (30 per minute and 500 per hour by default), counted in
@@ -117,9 +117,9 @@ Settings come from environment variables or a `.env` file.
 | `SHARE_MAX_TTL_SECONDS` | `2592000` (30 days) | Longest lifetime a share link may be given (at most a year); links last 1 day by default, or this if shorter |
 | `STORAGE_QUOTA_BYTES` | `1073741824` (1 GiB) | Bytes of images each user may store, unless they have a limit of their own (see [Storage quotas](#storage-quotas)); `0` means no limit |
 | `SHARE_MAX_CONCURRENT_CONVERSIONS` | `2` | Conversions that downloads through share links may run at once per API process; as many more wait up to 5 s, the rest get `503` |
-| `SIGNED_URL_MAX_CONCURRENT_RENDERS` | `2` | Renders (variants not in the cache) that signed URLs may run at once per API process, at most 8. One account holds at most half of them; 4 times as many requests (at most 8) wait up to 5 s, the rest get `503` (see [Limits and sizing](#limits-and-sizing)) |
-| `SIGNED_URL_RENDER_MEGAPIXELS_PER_MINUTE` | `300` | Megapixels of output each account's signed URLs may render per minute, counted in Redis; `0` turns this limit off |
-| `SIGNED_URL_RENDER_MEGAPIXELS_PER_HOUR` | `5000` | Megapixels of output each account's signed URLs may render per hour; `0` turns this limit off |
+| `SIGNED_URL_MAX_CONCURRENT_RENDERS` | `2` | Renders (variants not in the cache) that signed URLs may run at once per API process, at most 8. One account holds at most half of them; 4 times as many requests (at most 8) wait up to 5 s, of which one account may take all but one per slot it can't hold; the rest get `503` (see [Limits and sizing](#limits-and-sizing)) |
+| `SIGNED_URL_RENDER_MEGAPIXELS_PER_MINUTE` | `300` | Megapixels each account's signed URLs may render per minute (see [Limits and sizing](#limits-and-sizing)), counted in Redis; `0` turns this limit off |
+| `SIGNED_URL_RENDER_MEGAPIXELS_PER_HOUR` | `5000` | Megapixels each account's signed URLs may render per hour; `0` turns this limit off |
 | `PUBLIC_BASE_URL` | *(empty: webhooks off)* | The URL clients reach the API at, such as `https://api.example.com` (a path prefix is kept): webhook payloads link to jobs and images under it. While it is empty, `PUT /me/webhook` answers `503` and workers send no webhooks |
 | `WEBHOOK_SENDERS` | `4` | Threads in each worker that send webhook events (at most 8); `0`: this worker sends none |
 | `WEBHOOK_TIMEOUT_SECONDS` | `10` | How long one delivery attempt may take in all, from resolving the host to receiving the response's headers (at most 30) |
@@ -393,7 +393,7 @@ watermark**, then the result is encoded.
 | `filters` | `grayscale`, `sepia`, `blur` (Gaussian radius, up to 50) and `sharpen`. |
 | `watermark` | Text drawn in white with a dark outline. `position`: `top-left`, `top-right`, `bottom-left`, `bottom-right` or `center`. `size` is the font size in px (scales with the image when unset). |
 | `format` | `jpeg`, `png`, `webp`, `gif`, `bmp` or `tiff` (`jpg` and `tif` are accepted too). Defaults to the source format. |
-| `quality` | 1–100, for JPEG and WebP (defaults: 85 and 80). Other formats ignore it; PNG is always optimized losslessly. |
+| `quality` | 1–100, for JPEG and WebP (defaults: 85 and 80). Other formats ignore it. PNG is always lossless: stored results are optimized, while PNGs converted or rendered on every request (`/content`, share links, signed URLs) are compressed faster, into slightly larger files. |
 
 Unknown keys are rejected with `422`, so a typo never silently does nothing.
 
@@ -673,7 +673,7 @@ RateLimit: "minute";r=0;t=13, "hour";r=469;t=3000
 Clients should tolerate these headers being absent: they are only sent while the limits are
 enforced (Redis configured and reachable).
 
-Renders through signed URLs have limits of their own: per account, in megapixels of output (see
+Renders through signed URLs have limits of their own: per account, in megapixels (see
 [Limits and sizing](#limits-and-sizing)).
 
 ### Storage quota
@@ -783,8 +783,8 @@ curl -X DELETE localhost:8000/images/$ID/share-links -H "Authorization: Bearer $
 
 Signed URLs serve your images transformed on request, like Cloudinary's delivery URLs. Your
 backend builds and signs them itself, with no API call per URL, and puts them straight into
-`<img>` tags. Each variant is rendered on its first request, then cached by Redis, CDNs and
-browsers:
+`<img>` tags. Each variant is rendered on its first request, then cached by CDNs, browsers and
+Redis (see [Caching and CDNs](#caching-and-cdns) for variants too large for Redis):
 
 ```
 https://img.example.com/signed/AAECAwQFBgcICQoL/4AmFQXba4jMsNGGCkNvtzSvp/w_800,h_600,c_cover,q_80/bd06a108-6cf7-46fb-aea5-9c4437d80144.webp
@@ -1069,6 +1069,12 @@ image's conversions, so deleting the image drops them:
   shares its cache entry and ETag with `/content?format=&quality=` and share links.
 - `exp_` isn't part of the variant: URLs that differ only in their expiry share one render, but
   not one CDN entry.
+- **A variant larger than `CACHE_MAX_ITEM_BYTES`** (5 MB by default), such as a full-size PNG,
+  BMP or TIFF of a photo, isn't kept in Redis. Every request for it that reaches the API renders
+  it again (only the first render is charged to the account, see
+  [Limits and sizing](#limits-and-sizing)). Serve such variants through a CDN, raise
+  `CACHE_MAX_ITEM_BYTES` (and `REDIS_TIMEOUT_SECONDS` to match), or prefer `.jpg` and `.webp` for
+  large images.
 
 #### Rotating the key, and leaks
 
@@ -1096,13 +1102,18 @@ any number of variants. Renders are therefore limited in three ways.
    default), apart from share links' conversions.
    - One account holds at most half of these slots, and at least one.
    - Up to 4 times as many requests (at most 8) wait up to 5 s for a slot; the rest get `503`.
+     One account may take all of these waiting places but one per slot it can't hold (one, at
+     least), so other accounts can still queue: 7 of 8 with the defaults.
    - A request that waited looks in the cache again, so a crowd on a new variant renders it once
-     per process.
-2. **Per account, in megapixels of output.** By default an account's signed URLs may render 300
+     per process (if it is small enough for Redis).
+2. **Per account, in megapixels.** By default an account's signed URLs may render 300
    megapixels per minute and 5000 per hour, counted in Redis like the transformation limits (and
    not enforced without it).
-   - A render costs its output's width × height in megapixels, rounded up, and at least 1.
-   - Cached variants, `304`s and stored files cost nothing.
+   - A render costs its output's width × height in megapixels, or a quarter of its source's if
+     that is more (decoding a large image isn't free either), rounded up, and at least 1.
+   - It is counted once the source has been read: a storage outage costs nothing.
+   - Cached variants, `304`s and stored files cost nothing, and so do the renders of a variant too
+     large for Redis after its first one (while the image's cache entry lives).
    - Over the limit, renders get `429` with `Retry-After`. There are no `RateLimit` fields:
      viewers aren't the account.
 3. **Per render.** Renders have the limits of `POST /transform` (`MAX_DIMENSION`,
@@ -1111,7 +1122,15 @@ any number of variants. Renders are therefore limited in three ways.
 
 **Memory.** A render's memory peaks at a few copies of the larger of its source and its result.
 At the defaults (50-megapixel sources, 10000 × 10000 results, 4 bytes a pixel), budget about 2 GB
-per render slot. That comes on top of share links' conversions and `POST /transform`s.
+per render slot, or 4 GB if large `.webp` renders are expected: WebP's encoder needs the most
+(3.6 GB measured for a 10000 × 10000 watermarked WebP). A rendered body stays in memory until it
+has been sent, which a slow client can stretch out. That comes on top of share links'
+conversions and `POST /transform`s.
+
+**Time.** At the defaults' largest, a render takes tens of seconds (6–45 s measured for 100
+megapixels, by format). A 12-megapixel photo takes about 0.1–0.7 s as JPEG, 1–2 s as PNG and 2
+s as WebP. Requests that wait give up after 5 s, so a crowd on one slow new variant gets some
+`503`s until it is cached.
 
 **Threads.** Each waiting or rendering request holds one of the API process's 40 worker threads;
 with the defaults, signed URLs take at most 2 + 8 = 10 of them.
@@ -1166,8 +1185,10 @@ your application's images at scale.
   verifies, instead of boto3's default `aws-chunked` checksums, which several S3-compatible servers
   reject.
 - **Conversion cache** (`app/cache.py`): each image's conversions live in one Redis hash,
-  `imgsvc:variants:v1:{image id}`, whose fields are the ETag variants: conversions like
-  `webp-qdefault` and `jpeg-q40`, and signed URLs' transformations like `webp-t{hash}`. Lossless formats ignore `quality`, so they get one entry and one ETag. The cache is only read
+  `imgsvc:variants:v2:{image id}`, whose fields are the ETag variants: conversions like
+  `webp-qdefault` and `jpeg-q40`, and signed URLs' transformations like `webp-t{hash}`. A variant
+  over `CACHE_MAX_ITEM_BYTES` gets an empty `{variant}:too-large` field instead, which spares its
+  later renders through signed URLs a charge. Lossless formats ignore `quality`, so they get one entry and one ETag. The cache is only read
   after the ownership (share-link, signed-URL) check, the `304` check and the original-file check, so it can
   never serve one user's image to another. Deleting an image drops its hash; if that fails (Redis down), the
   leftover can't be served and expires with the TTL. Bump `v1` when encoder output changes.
@@ -1194,8 +1215,10 @@ your application's images at scale.
   are allowed without being counted (one warning per outage, then Redis is skipped for 5 seconds, as
   for the cache). Losing counters (a restart without persistence, eviction, a failover) only resets
   windows early. Keep `allkeys-lru` (or `volatile-lru`); never `volatile-ttl`, which would evict the
-  counters before cached conversions. A Redis ACL user needs `+get +incrby +expire +pttl +evalsha
-  +script|load` on `~imgsvc:*` for the limiters (plus the hash commands for the cache).
+  counters before cached conversions. A Redis ACL user needs `+get +incr +incrby +expire +pttl
+  +evalsha +script|load` on `~imgsvc:*` for the limiters (plus the hash commands for the cache).
+  `+incrby` is new with signed URLs' render limits: without it, transformations are still counted
+  (with `INCR`) but signed URL renders aren't limited (one warning per outage).
 - **Redis timeouts**: `REDIS_TIMEOUT_SECONDS` bounds each connection attempt, read and write, for
   both the cache and the limiter. While Redis stops answering, requests already in flight each wait
   up to that long before it is skipped. A hostname with several addresses is tried one address at a
@@ -1294,17 +1317,21 @@ your application's images at scale.
 - **Preflight** (`predict_output_size` in `app/imaging.py`): the output size is computed from the
   stored dimensions. The computation mirrors the crop, the resize (including `contain`'s rounding)
   and Pillow's arithmetic for rotations that expand the canvas. So a URL that would fail on size
-  is refused before the image is read, and the size it predicts is what the render costs.
+  is refused before the image is read, and the size it predicts sets what the render costs.
   `apply_transformations` runs the same check first, so `POST /transform` and jobs no longer
   allocate a huge rotated canvas only to refuse it.
 - **Signed URL renders** share `send_variant` with `/content` and share links:
   1. The variant cache is read.
   2. On a miss, the account's megapixel budget is checked without counting, so an account over
-     its budget gets a `429` without taking a waiting place.
+     its budget gets a `429` without taking a waiting place. A variant known to be too large for
+     Redis skips this, and the count in step 4: it was charged when first rendered.
   3. The request waits for one of the signed render slots. These are separate from share links'
      and are counted per account as well as in all.
   4. With a slot, it looks in the cache again (a request it waited for may have rendered the same
-     variant), and only then counts the megapixels and renders.
+     variant), reads the source, and only then counts the megapixels and renders. PNGs are
+     compressed at zlib level 3 instead of being optimized: a 12-megapixel photo takes about a
+     second instead of half a minute, for a file typically 10–30% larger. That's also why the cache key's
+     version went from `v1` to `v2`.
 
   The budget uses the transform limiter's Lua script with a cost (`INCRBY`), under
   `imgsvc:ratelimit:v1:render:{user id}:minute|hour`, and fails open like it. Transformations are

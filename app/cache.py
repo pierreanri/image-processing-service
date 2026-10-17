@@ -1,4 +1,5 @@
-"""Best-effort Redis cache for images converted on the fly (GET /images/{id}/content?format=).
+"""Best-effort Redis cache for images converted or rendered on the fly (GET
+/images/{id}/content?format=, share links, signed URLs).
 
 The cache can make a conversion faster but never make it fail: every Redis error is logged and
 treated as a miss. When Redis can't be reached or doesn't answer in time, it is skipped for a
@@ -20,7 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Bump the version whenever encoder output changes (Pillow options, default qualities) so bytes
 # produced by the old encoder are never served again.
-KEY_PREFIX = "imgsvc:variants:v1"
+KEY_PREFIX = "imgsvc:variants:v2"
+# The field that remembers a variant too large to cache (see VariantCache.too_large).
+_TOO_LARGE = ":too-large"
 
 
 class VariantCache:
@@ -61,14 +64,18 @@ class VariantCache:
         return data
 
     def set(self, image_id: uuid.UUID, variant: str, data: bytes) -> None:
-        if len(data) > self._max_item_bytes or not self._usable():
+        """Cache a variant; one larger than max_item_bytes is only remembered (too_large)."""
+        if not self._usable():
             return
+        field = variant
+        if len(data) > self._max_item_bytes:
+            field, data = variant + _TOO_LARGE, b""
         key = _key(image_id)
         started = self._outage.now()
         try:
             # MULTI/EXEC, so the hash never exists without a TTL.
             with self._client.pipeline() as pipe:
-                pipe.hset(key, variant, data)
+                pipe.hset(key, field, data)
                 pipe.expire(key, self._ttl_seconds)
                 pipe.execute()
         except redis.TimeoutError as exc:
@@ -86,6 +93,20 @@ class VariantCache:
         if self._writes_rejected:
             self._writes_rejected = False
             logger.info("Variant cache is accepting writes again")
+
+    def too_large(self, image_id: uuid.UUID, variant: str) -> bool:
+        """Whether `variant` was rendered while the image's entry lived, but was too large to
+        cache: signed URLs charge its renders only once."""
+        if not self._usable():
+            return False
+        started = self._outage.now()
+        try:
+            found = self._client.hexists(_key(image_id), variant + _TOO_LARGE)
+        except redis.RedisError as exc:
+            self._outage.failed(exc)
+            return False
+        self._outage.recovered(started)
+        return bool(found)
 
     def invalidate(self, image_id: uuid.UUID) -> None:
         # Attempted even during a cooldown: deletes are rare and should free the data promptly.

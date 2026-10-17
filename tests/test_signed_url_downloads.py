@@ -104,6 +104,11 @@ def make_photo(size: tuple[int, int] = (64, 48)) -> bytes:
     return buffer.getvalue()
 
 
+def pixels(data: bytes) -> tuple:
+    with Image.open(io.BytesIO(data)) as image:
+        return image.mode, image.size, image.tobytes()
+
+
 def upload(client, headers, data=None) -> dict:
     files = {"file": ("holiday.png", data or make_photo(), "image/png")}
     response = client.post("/images", headers=headers, files=files)
@@ -197,9 +202,14 @@ def test_a_signed_url_serves_what_post_transform_makes(
     response = client.get(signed_url(key, image["id"], extension, options))
 
     assert response.status_code == 200, response.text
-    assert response.content == expected
+    if derived["format"] == "png":
+        # The same pixels, compressed faster than a stored image is.
+        assert pixels(response.content) == pixels(expected)
+        assert response.content != expected
+    else:
+        assert response.content == expected
     assert response.headers["content-type"] == derived["mime_type"]
-    assert response.headers["content-length"] == str(len(expected))
+    assert response.headers["content-length"] == str(len(response.content))
     parsed = parse_options(options, derived["format"])
     token = transformation_variant("png", parsed.spec, parsed.transformations).token
     assert response.headers["etag"] == f'"{uuid.UUID(image["id"]).hex}-{token}"'
@@ -794,6 +804,65 @@ def test_renders_cost_their_account_the_megapixels_they_make(
     assert render_rate_limiter.checks == [(owner, cost) for cost in costs.values()]
     assert render_rate_limiter.costs == list(costs.values())
     assert render_rate_limiter.hits == [owner] * len(costs)
+
+
+def test_renders_of_large_images_cost_a_quarter_of_their_megapixels_at_least(
+    client, auth_headers, signer, key, render_rate_limiter
+):
+    """Decoding a 12-megapixel image isn't free, however little of it a render keeps."""
+    image = upload(client, auth_headers, make_image_bytes(size=(4000, 3000)))
+
+    for options in ("crop_0_0_1_1", "w_100", "w_5000"):
+        assert client.get(signed_url(key, image["id"], "jpg", options)).status_code == 200
+
+    assert render_rate_limiter.costs == [3, 3, math.ceil(5000 * 3750 / 1e6)]
+
+
+def test_a_variant_too_large_to_cache_is_rendered_each_time_but_charged_once(
+    client, auth_headers, signer, key, storage, variant_cache, render_rate_limiter
+):
+    variant_cache.max_item_bytes = 100
+    image = upload(client, auth_headers)
+    url = signed_url(key, image["id"], "png", "w_32")
+    reads = []
+    read = storage.read
+    storage.read = lambda key: reads.append(key) or read(key)
+
+    first = client.get(url)
+    render_rate_limiter.decision = REJECTED  # the account's budget is used up now
+    again = [client.get(url) for _ in range(3)]
+
+    assert len(first.content) > 100
+    for response in again:
+        assert response.status_code == 200
+        assert response.content == first.content
+    assert len(reads) == 4  # rendered each time...
+    assert render_rate_limiter.hits == [user_id_of(auth_headers)]  # ...but charged once
+    assert len(render_rate_limiter.checks) == 1
+    # Another variant is charged as usual (and refused now).
+    assert client.get(signed_url(key, image["id"], "png", "w_33")).status_code == 429
+    # Deleting the image forgets it.
+    client.delete(f"/images/{image['id']}", headers=auth_headers)
+    assert uuid.UUID(image["id"]) not in variant_cache.entries
+
+
+def test_a_storage_outage_costs_the_account_nothing(
+    client, auth_headers, signer, key, storage, render_rate_limiter
+):
+    image = upload(client, auth_headers)
+    url = signed_url(key, image["id"], "webp", "w_32")
+    read = storage.read
+
+    def unavailable(key):
+        raise StorageUnavailableError("down")
+
+    storage.read = unavailable
+    assert [client.get(url).status_code for _ in range(3)] == [503] * 3
+    assert render_rate_limiter.costs == []
+
+    storage.read = read
+    assert client.get(url).status_code == 200
+    assert render_rate_limiter.costs == [1]
 
 
 def test_an_account_over_its_render_budget_gets_429_without_waiting(

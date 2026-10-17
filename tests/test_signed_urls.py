@@ -443,9 +443,10 @@ def test_rotations_too_large_are_refused_before_rotating(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("slots", "waiting", "owner_slots"), [(1, 4, 1), (2, 8, 1), (4, 8, 2), (8, 8, 4)]
+    ("slots", "waiting", "owner_slots", "owner_waiting"),
+    [(1, 4, 1, 3), (2, 8, 1, 7), (3, 8, 1, 6), (4, 8, 2, 6), (8, 8, 4, 4)],
 )
-def test_render_slots_follow_the_setting(monkeypatch, slots, waiting, owner_slots):
+def test_render_slots_follow_the_setting(monkeypatch, slots, waiting, owner_slots, owner_waiting):
     settings = Settings(
         _env_file=None, jwt_secret="x" * 32, signed_url_max_concurrent_renders=slots
     )
@@ -457,7 +458,8 @@ def test_render_slots_follow_the_setting(monkeypatch, slots, waiting, owner_slot
         get_signed_render_slots.cache_clear()
 
     assert (made._slots, made._max_waiting, made._owner_slots) == (slots, waiting, owner_slots)
-    assert made._owner_waiting == slots
+    # One account leaves at least one waiting place to the others.
+    assert made._owner_waiting == owner_waiting
 
 
 @pytest.mark.parametrize(

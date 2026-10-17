@@ -44,11 +44,22 @@ def test_items_over_size_cap_are_not_stored(cache, image_id):
     assert cache.get(image_id, "bmp-qdefault") is None
 
 
+def test_variants_too_large_to_cache_are_remembered(redis_client, cache, image_id):
+    cache.set(image_id, "png-t1234", b"x" * 1025)
+
+    assert cache.get(image_id, "png-t1234") is None
+    assert cache.too_large(image_id, "png-t1234")
+    assert not cache.too_large(image_id, "png-t5678")
+    assert 0 < redis_client.ttl(f"{KEY_PREFIX}:{image_id.hex}") <= 60
+
+
 def test_invalidate_removes_every_variant(redis_client, cache, image_id):
     cache.set(image_id, "webp-qdefault", b"a")
     cache.set(image_id, "jpeg-q40", b"b")
+    cache.set(image_id, "png-t1234", b"x" * 1025)
 
     cache.invalidate(image_id)
 
     assert redis_client.exists(f"{KEY_PREFIX}:{image_id.hex}") == 0
     assert cache.get(image_id, "webp-qdefault") is None
+    assert not cache.too_large(image_id, "png-t1234")

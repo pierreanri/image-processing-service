@@ -74,10 +74,11 @@ class Settings(BaseSettings):
 
     # Signed URLs (GET /signed/...). Renders (variants not in the cache) that signed URLs may run
     # at once in each API process; up to 4 times as many (at most 8) wait up to 5 s, the rest get
-    # 503. One account holds at most half of them, so it can't hold up every other account.
+    # 503. One account holds at most half of the slots, and leaves at least one waiting place per
+    # other slot, so it can't hold up every other account.
     signed_url_max_concurrent_renders: int = Field(default=2, gt=0, le=8)
-    # Megapixels (of output) each account's signed URLs may render, counted in Redis (not
-    # enforced while REDIS_URL is empty or Redis is down). 0 turns a limit off.
+    # Megapixels each account's signed URLs may render (see app/routers/signed.py), counted in
+    # Redis (not enforced while REDIS_URL is empty or Redis is down). 0 turns a limit off.
     signed_url_render_megapixels_per_minute: int = Field(default=300, ge=0)
     signed_url_render_megapixels_per_hour: int = Field(default=5000, ge=0)
 

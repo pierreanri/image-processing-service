@@ -3,7 +3,7 @@ GET /images/{id}/content, GET /shared/{token}.{ext} (share links) and GET /signe
 URLs)."""
 
 import hashlib
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from email.utils import formatdate
 from typing import Protocol
@@ -42,7 +42,7 @@ class RenderGate(Protocol):
         """Before waiting for a slot: raise if no render may start now, counting nothing."""
 
     def charge(self) -> None:
-        """Right before rendering: count the render, or raise."""
+        """Once the image is read, right before rendering: count the render, or raise."""
 
 
 def image_variant(
@@ -123,28 +123,38 @@ def send_variant(
         )
 
     data = cache.get(image.id, variant.token)
-    if data is None and conversion_slots is None:
-        if gate is not None:
-            gate.charge()
-        data = _render(image, variant, storage, settings, cache)
-    elif data is None:
-        if gate is not None:
-            gate.admit()
-        with conversion_slots.hold(None if gate is None else gate.owner):
-            # A request this one waited for may have just cached the same variant.
-            data = cache.get(image.id, variant.token)
-            if data is None:
-                if gate is not None:
-                    gate.charge()
-                data = _render(image, variant, storage, settings, cache)
+    if data is None:
+        # A variant too large to cache is rendered for every request, but charged only once.
+        charge = None
+        if gate is not None and not cache.too_large(image.id, variant.token):
+            charge = gate.charge
+        if conversion_slots is None:
+            data = _render(image, variant, storage, settings, cache, charge)
+        else:
+            if charge is not None:
+                gate.admit()
+            with conversion_slots.hold(None if gate is None else gate.owner):
+                # A request this one waited for may have just cached the same variant.
+                data = cache.get(image.id, variant.token)
+                if data is None:
+                    data = _render(image, variant, storage, settings, cache, charge)
     return Response(data, media_type=FORMATS[variant.spec.format].mime_type, headers=headers)
 
 
 def _render(
-    image: Image, variant: Variant, storage: Storage, settings: Settings, cache: VariantCache
+    image: Image,
+    variant: Variant,
+    storage: Storage,
+    settings: Settings,
+    cache: VariantCache,
+    charge: Callable[[], None] | None,
 ) -> bytes:
-    loaded = load_image(storage.read(image.storage_key), settings.max_image_pixels)
-    data = apply_transformations(loaded, variant.spec, settings.max_dimension).data
+    source = storage.read(image.storage_key)
+    # Not before the read: a storage outage renders nothing, so it must cost nothing.
+    if charge is not None:
+        charge()
+    loaded = load_image(source, settings.max_image_pixels)
+    data = apply_transformations(loaded, variant.spec, settings.max_dimension, fast=True).data
     cache.set(image.id, variant.token, data)
     return data
 

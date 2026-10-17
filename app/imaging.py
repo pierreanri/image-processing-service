@@ -119,9 +119,9 @@ def load_image(data: bytes, max_pixels: int) -> LoadedImage:
 
 
 def apply_transformations(
-    loaded: LoadedImage, spec: TransformationSpec, max_dimension: int
+    loaded: LoadedImage, spec: TransformationSpec, max_dimension: int, *, fast: bool = False
 ) -> EncodedImage:
-    """Apply `spec` to an image and encode the result.
+    """Apply `spec` to an image and encode the result (`fast`: see encode_image).
 
     Order: crop, resize, rotate, flip, mirror, filters, watermark, then encode.
     """
@@ -153,7 +153,7 @@ def apply_transformations(
     if spec.watermark is not None:
         image = _watermark(image, spec.watermark)
 
-    return encode_image(image, image_format, spec.quality)
+    return encode_image(image, image_format, spec.quality, fast=fast)
 
 
 def predict_output_size(
@@ -184,7 +184,12 @@ def predict_output_size(
     return width, height
 
 
-def encode_image(image: Image.Image, image_format: str, quality: int | None = None) -> EncodedImage:
+def encode_image(
+    image: Image.Image, image_format: str, quality: int | None = None, *, fast: bool = False
+) -> EncodedImage:
+    """Encode `image`. Stored images are compressed as much as the format allows; `fast` is for
+    images encoded on every request (conversions, signed URLs), where an optimized PNG of a
+    photo can take half a minute: the same pixels in a slightly larger file, many times faster."""
     info = FORMATS[image_format]
     if not info.supports_alpha and _has_alpha(image):
         image = _flatten(image)
@@ -199,7 +204,7 @@ def encode_image(image: Image.Image, image_format: str, quality: int | None = No
             image = image.convert("RGBA" if _has_alpha(image) else "RGB")
         options = {"quality": quality or DEFAULT_QUALITY["webp"], "method": 4}
     elif image_format == "png":
-        options = {"optimize": True}
+        options = {"compress_level": 3} if fast else {"optimize": True}
     elif image_format == "tiff":
         options = {"compression": "tiff_lzw"}
 

@@ -55,9 +55,11 @@ def make_image_bytes(
 
 
 class InMemoryVariantCache:
-    """Stand-in for app.cache.VariantCache that keeps entries in a dict."""
+    """Stand-in for app.cache.VariantCache that keeps entries in a dict (items over
+    `max_item_bytes`, if given, are only remembered, as there)."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_item_bytes: int | None = None) -> None:
+        self.max_item_bytes = max_item_bytes
         self.entries: dict[uuid.UUID, dict[str, bytes]] = {}
         self.reads: list[tuple[uuid.UUID, str]] = []
 
@@ -66,7 +68,13 @@ class InMemoryVariantCache:
         return self.entries.get(image_id, {}).get(variant)
 
     def set(self, image_id: uuid.UUID, variant: str, data: bytes) -> None:
+        if self.max_item_bytes is not None and len(data) > self.max_item_bytes:
+            variant, data = f"{variant}:too-large", b""
         self.entries.setdefault(image_id, {})[variant] = data
+
+    def too_large(self, image_id: uuid.UUID, variant: str) -> bool:
+        self.reads.append((image_id, f"{variant}:too-large"))
+        return f"{variant}:too-large" in self.entries.get(image_id, {})
 
     def invalidate(self, image_id: uuid.UUID) -> None:
         self.entries.pop(image_id, None)
