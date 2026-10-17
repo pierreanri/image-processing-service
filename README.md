@@ -842,8 +842,8 @@ Options are comma-separated tokens, written in this order, each at most once:
 extension is the stored format's, and converts it otherwise. Limits and order of application are
 those of [Transformations](#transformations).
 
-**Each variant has exactly one spelling.** A URL spelled any other way answers `422`, and the
-detail names the right spelling (`sign "w_800,h_600" instead`). The rules:
+**Each set of options has exactly one spelling.** A URL spelled any other way answers `422`, and
+the detail names the right spelling (`sign "w_800,h_600" instead`). The rules:
 - tokens follow the table's order;
 - defaults are left out: `c_fill`, `g_bottom-right`, `o_50`, `a_0`, and `q_` on lossless
   formats;
@@ -851,14 +851,20 @@ detail names the right spelling (`sign "w_800,h_600" instead`). The rules:
 - decimals are rounded to 2 decimals, with no trailing zeros: `a_12.5`, `blur_2`;
 - options that change nothing are left out, together with their `/`.
 
+Different options can still render the same image: `a_180` and `flip,mirror`, or `q_85` on a
+`.jpg` and no `q_` at all (an explicit `q_` is a variant of its own, since it also re-encodes a
+stored JPEG that a URL without options would serve as uploaded). Pick one spelling per image in
+your pages, so each variant is rendered and cached once.
+
 **The signature** is the first 24 characters of the unpadded base64url HMAC-SHA256 of everything
 after it (`[{options}/]{image id}.{extension}`), keyed with the key string, `urlsec_` included.
 
 **Send a URL exactly as signed.** A URL with percent-encoding (such as `%2C` for a comma) or any
-query string is refused with `404`, so each variant has one URL and one cache entry. Image ids
+query string is refused with `404`, so a set of options has one URL and one cache entry. Image ids
 are lowercase, as the API writes them.
 
-These functions build URLs from the `transformations` that `POST /images/{id}/transform` takes.
+These functions build URLs from the `transformations` that `POST /images/{id}/transform` takes,
+with the JSON types shown under [Transformations](#transformations) (real booleans and numbers).
 The tests check both of them against the server's own spelling.
 
 <!-- signed-url-sample python -->
@@ -876,6 +882,7 @@ def signed_url(url_prefix, key, image_id, format, transformations=None, expires=
     """The URL of an image rendered as `format` ("jpeg", "png", "webp", "gif", "bmp" or "tiff")
     with POST /transform's `transformations` (without "format"), working until the Unix time
     `expires` if given. `url_prefix` and `key` are what POST /me/url-signing-key returned."""
+    format = {"jpg": "jpeg", "tif": "tiff"}.get(format, format)
     t = transformations or {}
     tokens = []
     if crop := t.get("crop"):
@@ -937,6 +944,7 @@ const number = (value) => value.toFixed(2).replace(/\.?0+$/, "");
  * if given. `urlPrefix` and `key` are what POST /me/url-signing-key returned.
  */
 export function signedUrl(urlPrefix, key, imageId, format, transformations, expires) {
+  format = { jpg: "jpeg", tif: "tiff" }[format] ?? format;
   const t = transformations ?? {};
   const tokens = [];
   if (t.crop) {
@@ -949,7 +957,8 @@ export function signedUrl(urlPrefix, key, imageId, format, transformations, expi
     if (height != null) tokens.push(`h_${height}`);
     if (width != null && height != null && (fit ?? "fill") !== "fill") tokens.push(`c_${fit}`);
   }
-  const turn = (((t.rotate ?? 0) % 360) + 360) % 360;
+  let turn = (t.rotate ?? 0) % 360;
+  if (turn < 0) turn += 360; // as Python's %, which the server uses
   if (turn) {
     const angle = number(turn);
     if (angle === "0" || angle === "360") {
@@ -975,7 +984,7 @@ export function signedUrl(urlPrefix, key, imageId, format, transformations, expi
     if (size != null) tokens.push(`fs_${size}`);
   }
   if (t.quality != null && (format === "jpeg" || format === "webp")) tokens.push(`q_${t.quality}`);
-  if (expires != null) tokens.push(`exp_${expires}`);
+  if (expires != null) tokens.push(`exp_${Math.trunc(expires)}`);
 
   let path = `${imageId}.${format === "jpeg" ? "jpg" : format}`;
   if (tokens.length) path = `${tokens.join(",")}/${path}`;
@@ -1003,7 +1012,9 @@ signed_url(
 ```
 
 Both functions raise when a nonzero `rotate` or `blur` would round to nothing at 2 decimals. If
-they didn't, the URL would silently drop the transformation.
+they didn't, the URL would silently drop the transformation. A value exactly halfway between two
+hundredths (such as an angle of 0.125) may be rounded differently by the two (Python rounds such
+ties to an even digit, JavaScript up): both spellings are valid, but they are two variants.
 
 The syntax looks like Cloudinary's, with these differences:
 - `c_contain` and `c_cover`, where Cloudinary has `c_fit` and `c_fill`;
@@ -1036,8 +1047,9 @@ URL, and so reuse browser caches, if they round the expiry (to the end of the we
 | `429` with `Retry-After` | The account's signed URLs rendered too much (see [Limits](#limits-and-sizing)) | `no-store` |
 | `503` with `Retry-After` | Storage unavailable, or too many renders in progress | `no-store` |
 
-- **Any page can embed or fetch them.** Every answer carries `Access-Control-Allow-Origin: *`,
-  and images also carry `Cross-Origin-Resource-Policy: cross-origin`.
+- **Any page can embed or fetch them.** Every answer to a `GET` carries
+  `Access-Control-Allow-Origin: *`, and images also carry
+  `Cross-Origin-Resource-Policy: cross-origin`.
 - **`HEAD` isn't supported** (`405`).
 - **`Authorization` headers are ignored.**
 
@@ -1309,8 +1321,8 @@ your application's images at scale.
   - The signature (144 bits) covers everything after it: the options, the image id and the
     extension.
   - The options are parsed leniently, validated as `POST /transform` validates them, encoded again
-    and compared byte for byte: so every variant has one URL (one cache entry, one CDN object),
-    and a URL's holder can't vary it to make new renders.
+    and compared byte for byte: so every set of options has one URL (one cache entry, one CDN
+    object), and a URL's holder can't vary it to make new renders.
   - The expiry comes next. Then one statement loads the image joined to the key on its owner, so
     a rotated or deleted key, a deleted image and another account's image all look alike (`410`),
     and only then can the URL answer `304`.

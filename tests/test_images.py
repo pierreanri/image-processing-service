@@ -624,6 +624,23 @@ def test_limit_is_checked_after_auth_validation_and_ownership(
     assert rate_limiter.hits == []
 
 
+@pytest.mark.parametrize("prefer", [None, "respond-async"])
+def test_watermark_text_with_nul_is_refused(client, auth_headers, rate_limiter, prefer):
+    """PostgreSQL can't store U+0000 in the transformations recorded with the image or job."""
+    image = uploaded(client, auth_headers)
+    headers = {**auth_headers, **({"Prefer": prefer} if prefer else {})}
+
+    response = client.post(
+        f"/images/{image['id']}/transform",
+        headers=headers,
+        json={"transformations": {"watermark": {"text": "a\u0000b"}}},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["msg"] == "Value error, must not contain NUL (U+0000)"
+    assert rate_limiter.hits == []
+
+
 def test_failed_transformation_still_counts(client, auth_headers, rate_limiter):
     image = uploaded(client, auth_headers, data=make_image_bytes(size=(100, 50)))
 

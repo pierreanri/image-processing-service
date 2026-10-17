@@ -8,6 +8,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    field_validator,
     model_validator,
 )
 
@@ -118,6 +119,14 @@ class WatermarkSpec(StrictModel):
     size: int | None = Field(
         default=None, ge=8, le=500, description="Font size in px; scales with the image if unset."
     )
+
+    @field_validator("text")
+    @classmethod
+    def _no_nul(cls, text: str) -> str:
+        # PostgreSQL can't store U+0000 in the transformations recorded with an image or a job.
+        if "\x00" in text:
+            raise ValueError("must not contain NUL (U+0000)")
+        return text
 
 
 class TransformationSpec(StrictModel):

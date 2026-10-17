@@ -14,7 +14,7 @@ The options are comma-separated tokens that map one to one onto POST /transform'
 transformations (see `format_options`), in a single canonical spelling: in the order they are
 applied, defaults left out, numbers written one way, watermark text as unpadded base64url of its
 UTF-8 bytes, and the expiry last. A URL whose options aren't in that spelling is refused, never
-normalized, so each variant has exactly one URL and a signed URL can't be varied.
+normalized, so each set of options has exactly one URL and a signed URL can't be varied.
 """
 
 import base64
@@ -246,6 +246,10 @@ def parse_options(options: str | None, image_format: str) -> SignedOptions:
         token = _TOKEN_OF.get(location[:2]) or _TOKEN_OF.get(location[0], location[0])
         message = error["msg"].removeprefix("Value error, ")
         raise InvalidOptions(f"{token}: {message}") from None
+    blur = spec.filters.blur if spec.filters is not None else None
+    if blur is not None and _number(blur) == "0":
+        # Its spelling would be "blur_0", which no URL may have.
+        raise InvalidOptions("blur_: must be at least 0.01")
     canonical = format_options(spec, expires)
     if canonical != (options or ""):
         if not canonical:

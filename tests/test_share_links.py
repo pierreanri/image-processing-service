@@ -608,6 +608,22 @@ def test_a_storage_outage_is_503_and_the_log_hides_the_link(
     assert token[36:] not in record.getMessage()
 
 
+def test_a_conversion_the_settings_no_longer_allow_is_refused_readably(
+    client, auth_headers, signer, settings
+):
+    image = upload(client, auth_headers)  # 64x48
+    link = share(client, auth_headers, image["id"], format="webp")
+    settings.max_image_pixels = 1000  # lowered since the link was made
+
+    response = client.get(link["url"])
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Image is too large (64x48 pixels)"}
+    # Like every answer to a share link: never cached, readable from any page.
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
 def test_head_is_not_supported(client, auth_headers, signer):
     image = upload(client, auth_headers)
     link = share(client, auth_headers, image["id"])

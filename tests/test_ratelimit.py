@@ -223,6 +223,24 @@ def test_rejections_do_not_end_an_outage_of_refused_writes(
     assert limiter_log_levels(caplog) == ["WARNING", "DEBUG"]
 
 
+def test_a_successful_check_does_not_end_an_outage(redis_mock, script, clock, caplog):
+    """A check runs only GET and PTTL, which a read-only or full Redis still answers: only a
+    counted request proves that Redis takes writes again."""
+    caplog.set_level(logging.DEBUG, logger="app.ratelimit")
+    limiter = RateLimiter(redis_mock, (MINUTE, HOUR), clock=clock)
+
+    script.side_effect = redis.exceptions.ReadOnlyError("read only")
+    assert limiter.hit(USER) is UNCHECKED
+    clock.advance(5.1)
+    script.side_effect = None
+    script.return_value = FRESH_REPLY
+    assert limiter.check(USER, cost=3).allowed
+    script.side_effect = redis.exceptions.ReadOnlyError("read only")
+    assert limiter.hit(USER, cost=3) is UNCHECKED
+
+    assert limiter_log_levels(caplog) == ["WARNING", "DEBUG"]
+
+
 def test_non_redis_errors_propagate(redis_mock, script):
     script.side_effect = ValueError("bug")
 

@@ -292,6 +292,10 @@ SENTINEL = "987654321"
         ("crop_0_0_0_3", "crop_: Input should be greater than 0"),
         ("a_400", "a_: Input should be less than or equal to 360"),
         ("blur_0", "blur_: Input should be greater than 0"),
+        ("blur_0.004", "blur_: must be at least 0.01"),
+        ("blur_0.004,sharpen", "blur_: must be at least 0.01"),
+        ("blur_0.001,exp_1791204110", "blur_: must be at least 0.01"),
+        ("wm_AA", "wm_: must not contain NUL (U+0000)"),
         ("blur_50.01", "blur_: Input should be less than or equal to 50"),
         ("wm_SGk,fs_7", "fs_: Input should be greater than or equal to 8"),
         ("wm_SGk,fs_501", "fs_: Input should be less than or equal to 500"),
@@ -568,8 +572,8 @@ def expected_url(image_id: str, image_format: str, transformations: dict, expire
     spec = TransformationSpec.model_validate(
         {**{k: v for k, v in transformations.items() if v is not None}, "format": image_format}
     )
-    options = format_options(spec, expires)
-    extension = "jpg" if image_format == "jpeg" else image_format
+    options = format_options(spec, None if expires is None else int(expires))
+    extension = "jpg" if spec.format == "jpeg" else spec.format
     path = f"{options}/{image_id}.{extension}" if options else f"{image_id}.{extension}"
     return f"{URL_PREFIX}{sign(KEY, path)}/{path}"
 
@@ -600,6 +604,14 @@ SAMPLE_CASES = [
     ("webp", {"watermark": {"text": "x" * 100, "position": "bottom-right", "opacity": 0.5}}, None),
     ("webp", {"watermark": {"text": "Hi", "opacity": 0.29}, "quality": 1}, None),
     ("webp", {"watermark": {"text": "Hi", "opacity": 0}}, None),
+    # Near a half-hundredth, but not an exact binary tie: one spelling only.
+    ("png", {"rotate": 0.005}, None),
+    ("png", {"rotate": 45.005}, None),
+    ("png", {"rotate": 154.975}, None),
+    ("png", {"rotate": -45.005}, None),
+    ("png", {}, 1_790_000_000.75),  # say, time.time() + 3600
+    ("jpg", {"quality": 40}, None),  # format aliases, as POST /transform takes them
+    ("tif", {"flip": True}, None),
 ]
 
 
@@ -671,29 +683,37 @@ def test_the_python_sample_spells_options_as_the_server_does(
     assert url == expected_url(IMAGE_ID, image_format, transformations, expires)
 
 
-def test_the_samples_agree_with_the_server_on_many_transformations(python_sample, js_sample):
-    cases = SAMPLE_CASES + random_cases(300)
+MANY_CASES = SAMPLE_CASES + random_cases(300)
+# The server would read a URL for these as no rotation, or an invalid blur.
+UNWRITABLE = [
+    {"rotate": 0.004},
+    {"rotate": -0.004},
+    {"rotate": 359.996},
+    {"rotate": 1e-300},
+    {"filters": {"blur": 0.004}},
+]
 
-    js_urls = js_sample([[URL_PREFIX, KEY, IMAGE_ID, *case] for case in cases])
 
-    for case, js_url in zip(cases, js_urls, strict=True):
-        expected = expected_url(IMAGE_ID, *case)
-        assert python_sample(URL_PREFIX, KEY, IMAGE_ID, *case) == expected, case
-        assert js_url == expected, case
+def test_the_python_sample_agrees_with_the_server_on_many_transformations(python_sample):
+    for case in MANY_CASES:
+        assert python_sample(URL_PREFIX, KEY, IMAGE_ID, *case) == expected_url(IMAGE_ID, *case)
 
 
-@pytest.mark.parametrize(
-    "transformations",
-    [
-        {"rotate": 0.004},
-        {"rotate": -0.004},
-        {"rotate": 359.996},
-        {"filters": {"blur": 0.004}},
-    ],
-)
-def test_the_samples_refuse_what_2_decimals_cannot_write(python_sample, js_sample, transformations):
-    """The server would read such a URL as no rotation or an invalid blur."""
+def test_the_js_sample_agrees_with_the_server_on_many_transformations(js_sample):
+    js_urls = js_sample([[URL_PREFIX, KEY, IMAGE_ID, *case] for case in MANY_CASES])
+
+    for case, js_url in zip(MANY_CASES, js_urls, strict=True):
+        assert js_url == expected_url(IMAGE_ID, *case), case
+
+
+@pytest.mark.parametrize("transformations", UNWRITABLE)
+def test_the_python_sample_refuses_what_2_decimals_cannot_write(python_sample, transformations):
     with pytest.raises(ValueError, match="2 decimals"):
         python_sample(URL_PREFIX, KEY, IMAGE_ID, "png", transformations)
-    [js_url] = js_sample([[URL_PREFIX, KEY, IMAGE_ID, "png", transformations, None]])
-    assert js_url.startswith("Error: ") and "2 decimals" in js_url
+
+
+def test_the_js_sample_refuses_what_2_decimals_cannot_write(js_sample):
+    js_urls = js_sample([[URL_PREFIX, KEY, IMAGE_ID, "png", t, None] for t in UNWRITABLE])
+
+    for transformations, js_url in zip(UNWRITABLE, js_urls, strict=True):
+        assert js_url.startswith("Error: ") and "2 decimals" in js_url, transformations
